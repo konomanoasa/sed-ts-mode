@@ -42,9 +42,9 @@
 
 (defconst sed-ts-mode--grammar-sources
   '((sed "https://github.com/konomanoasa/tree-sitter-sed"
-         :revision "v0.7.0")
+         :revision "v0.14.0")
     (sed_ere "https://github.com/konomanoasa/tree-sitter-sed"
-             :revision "v0.7.0"
+             :revision "v0.14.0"
              :source-dir "sed_ere/src"))
   "Tree-sitter grammar sources for POSIX sed.")
 
@@ -90,33 +90,11 @@
                    verb: (function_verb) @comment)
                   (block_function
                    verb: (function_verb) @delimiter)
-                  (closing_brace
-                   (closing_brace_token) @delimiter))
+                  (block_function
+                   closing: (closing_brace) @delimiter))
                 t)))
           (push (cons language query) sed-ts-mode-syntax--query-cache)
           query))))
-
-(defun sed-ts-mode-syntax--captures (parser &optional start end)
-  "Return syntax captures from PARSER between START and END."
-  (with-current-buffer (treesit-parser-buffer parser)
-    (save-restriction
-      (widen)
-      (let ((start (or start (point-min)))
-            (end (or end (point-max)))
-            (query (sed-ts-mode-syntax--query
-                    (treesit-parser-language parser)))
-            captures)
-        (dolist (capture
-                 (treesit-query-capture
-                  (treesit-parser-root-node parser)
-                  query start end))
-          (let ((node (cdr capture)))
-            (push (list (car capture)
-                        (treesit-node-start node)
-                        (treesit-node-end node))
-                  captures)))
-        (sort captures
-              (lambda (left right) (< (nth 1 left) (nth 1 right))))))))
 
 ;;;;; Propertization
 
@@ -136,12 +114,16 @@
         (remove-text-properties (point-min) start '(syntax-table nil))
         (setq start (point-min))
         (syntax-ppss-flush-cache start))
-      (dolist (capture (sed-ts-mode-syntax--captures
-                        treesit-primary-parser start end))
+      (dolist (capture (treesit-query-capture
+                        (treesit-parser-root-node treesit-primary-parser)
+                        (sed-ts-mode-syntax--query
+                         (treesit-parser-language treesit-primary-parser))
+                        start end))
         (let* ((name (car capture))
+               (node (cdr capture))
                (position (if (eq name 'comment)
-                             (nth 1 capture)
-                           (1- (nth 2 capture)))))
+                             (treesit-node-start node)
+                           (1- (treesit-node-end node)))))
           (put-text-property
            position (1+ position) 'syntax-table
            (if (eq name 'comment)
@@ -212,27 +194,26 @@
 (defun sed-ts-mode-font-lock--regexp-patterns (language)
   "Return regular-expression font-lock patterns for LANGUAGE."
   (append
-   '((ordinary_character_token) @font-lock-regexp-face
+   '((ordinary_character) @font-lock-regexp-face
 
-     [(left_anchor_token)
-      (right_anchor_token)
+     [(left_anchor)
+      (right_anchor)
       (zero_or_more_operator)] @font-lock-operator-face
 
-     (dup_count_token) @font-lock-number-face
+     (dup_count) @font-lock-number-face
 
      [(open_bracket)
-      (close_bracket_token)] @font-lock-bracket-face
+      (close_bracket)] @font-lock-bracket-face
 
      (nonmatching_list_operator) @font-lock-negation-char-face
      (range_operator) @font-lock-operator-face
 
-     [(quoted_character_token)
-      (sed_newline_escape_token)] @font-lock-escape-face
-     (escaped_delimiter
-      (escaped_delimiter_token) @font-lock-escape-face)
+     [(quoted_character)
+      (sed_newline_escape)] @font-lock-escape-face
+     (escaped_delimiter) @font-lock-escape-face
 
-     [(period_token)
-      (collating_element_token)
+     [(period)
+      (collating_element)
       (class_name)
       (coll_elem_single)
       (coll_elem_multi)
@@ -255,22 +236,22 @@
    (pcase language
      ('sed
       '([(back_open_parenthesis)
-         (back_close_parenthesis_token)
+         (back_close_parenthesis)
          (back_open_brace)
          (back_close_brace)] @font-lock-bracket-face
-        [(back_bar)
-         (back_plus)
-         (back_qm)] @font-lock-operator-face
-        (backreference_token) @font-lock-constant-face))
+         [(back_bar)
+          (back_plus)
+          (back_qm)] @font-lock-operator-face
+         (backreference) @font-lock-constant-face))
      ('sed_ere
       '([(open_parenthesis)
-         (close_parenthesis_token)
+         (close_parenthesis)
          (open_brace)
          (close_brace)] @font-lock-bracket-face
-        [(ere_alternation_operator_token)
-         (one_or_more_operator)
-         (zero_or_one_operator)
-         (repetition_modifier)] @font-lock-operator-face))
+         [(ere_alternation_operator)
+          (one_or_more_operator)
+          (zero_or_one_operator)
+          (repetition_modifier)] @font-lock-operator-face))
      (_ (user-error "Unsupported sed Tree-sitter language: %S"
                     language)))))
 
@@ -291,14 +272,13 @@
       (comment_text) @font-lock-comment-face))
 
    :feature 'label
-   '((label_token) @font-lock-constant-face)
+   '((label_literal) @font-lock-constant-face)
 
    :feature 'string
-   '([(rfile_token)
-      (wfile_token)
-      (text_literal_token)
-      (replacement_literal_token)
-      (translation_literal_token)] @font-lock-string-face)
+   '([(file_literal)
+      (text_literal)
+      (replacement_literal)
+      (translation_literal)] @font-lock-string-face)
 
    :feature 'number
    '([(line_number_address)
@@ -310,42 +290,38 @@
       (case_insensitive_flag)
       (print_flag)
       (substitution_flag)
-      (matched_text_reference_token)
-      (replacement_backreference_token)] @font-lock-constant-face)
+      (matched_text_reference)
+      (replacement_backreference)] @font-lock-constant-face)
 
    :feature 'escape
    '([(address_escape)
-      (text_backslash_escape_token)
-      (replacement_escape_token)
-      (translation_escape_token)] @font-lock-escape-face
-     (replacement_escaped_delimiter
-      (escaped_delimiter_token) @font-lock-escape-face)
-     (translation_escaped_delimiter
-      (escaped_delimiter_token) @font-lock-escape-face))
+      (text_backslash_escape)
+      (replacement_escape)
+      (translation_escape)
+      (replacement_escaped_delimiter)
+      (translation_escaped_delimiter)] @font-lock-escape-face)
 
    :feature 'operator
    '((negation_operator) @font-lock-operator-face)
 
    :feature 'delimiter
-   '((delimiter_token) @font-lock-delimiter-face)
+   '((delimiter) @font-lock-delimiter-face)
 
    :feature 'punctuation
-   '([(text_introducer_token)
-      (text_escaped_newline_token)
-      (escaped_newline_token)] @font-lock-punctuation-face
-     [(address_separator_token)
-      (interval_separator)] @font-lock-punctuation-face
-     ((command_separator) @font-lock-punctuation-face
-      (:equal @font-lock-punctuation-face ";")))
+   '([(text_introducer)
+      (text_escaped_newline)
+      (escaped_newline)] @font-lock-punctuation-face
+      [(address_separator)
+       (interval_separator)] @font-lock-punctuation-face
+      ((command_separator) @font-lock-punctuation-face
+       (:equal @font-lock-punctuation-face ";")))
 
    :feature 'bracket
    '((block_function
       verb: (function_verb)
       @font-lock-bracket-face)
      (block_function
-      closing: (closing_brace
-                (closing_brace_token)
-                @font-lock-bracket-face)))
+      closing: (closing_brace) @font-lock-bracket-face))
 
    :feature 'regexp
    (sed-ts-mode-font-lock--regexp-patterns language)))
@@ -367,24 +343,21 @@
   "Regexp matching POSIX sed label definitions.")
 
 (defconst sed-ts-mode-imenu-settings
-  `((nil ,sed-ts-mode--label-function-regexp
-         sed-ts-mode--label-function-p nil))
+  `(("Label" ,sed-ts-mode--label-function-regexp
+     sed-ts-mode--label-function-p nil))
   "Tree-sitter Imenu settings for POSIX sed.")
 
 (defun sed-ts-mode--label-function-p (node)
   "Return non-nil when NODE is a named POSIX sed label definition."
   (and (treesit-node-match-p
         node sed-ts-mode--label-function-regexp)
-       (let* ((label (treesit-node-child-by-field-name node "label"))
-              (name (and label (treesit-node-child label 0 t))))
-         (and name (equal (treesit-node-type name) "label_token")))))
+       (let ((label (treesit-node-child-by-field-name node "label")))
+         (and label (equal (treesit-node-type label) "label")))))
 
 (defun sed-ts-mode--defun-name (node)
   "Return the name of the label definition NODE."
   (when (sed-ts-mode--label-function-p node)
-    (let* ((label (treesit-node-child-by-field-name node "label"))
-           (name (and label (treesit-node-child label 0 t))))
-      (treesit-node-text name t))))
+    (treesit-node-text (treesit-node-child-by-field-name node "label") t)))
 
 (defun sed-ts-mode-imenu-setup ()
   "Configure Imenu for the current buffer."
@@ -420,12 +393,8 @@
              treesit-language-source-alist
            (cons (assq language sed-ts-mode--grammar-sources)
                  treesit-language-source-alist))))
-    (treesit-ensure-installed language)))
-
-(defun sed-ts-mode--require-grammar (language)
-  "Ensure that the grammar for LANGUAGE is available."
-  (unless (sed-ts-mode--ensure-grammar language)
-    (user-error "Tree-sitter grammar `%s' is unavailable" language)))
+    (or (treesit-ensure-installed language)
+        (user-error "Tree-sitter grammar `%s' is unavailable" language))))
 
 (defun sed-ts-mode--configure ()
   "Configure Tree-sitter features for the current buffer."
@@ -439,7 +408,7 @@
   "Configure `sed-ts-mode' in the current buffer."
   (setq-local sed-ts-mode-regexp-syntax sed-ts-mode-regexp-syntax)
   (let ((language (sed-ts-mode--language sed-ts-mode-regexp-syntax)))
-    (sed-ts-mode--require-grammar language)
+    (sed-ts-mode--ensure-grammar language)
     (setq-local treesit-primary-parser (treesit-parser-create language)))
   (sed-ts-mode--configure))
 
@@ -449,7 +418,7 @@
          (parser treesit-primary-parser))
     (if (eq language (treesit-parser-language parser))
         (setq-local sed-ts-mode-regexp-syntax syntax)
-      (sed-ts-mode--require-grammar language)
+      (sed-ts-mode--ensure-grammar language)
       (let ((new-parser (treesit-parser-create language)))
         (setq-local sed-ts-mode-regexp-syntax syntax)
         (setq-local treesit-primary-parser new-parser)
