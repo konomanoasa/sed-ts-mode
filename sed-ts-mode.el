@@ -34,6 +34,7 @@
 
 ;;; Code:
 
+(require 'editorconfig)
 (require 'treesit)
 
 (defgroup sed-ts nil
@@ -42,27 +43,22 @@
 
 (defconst sed-ts-mode--grammar-sources
   '((sed "https://github.com/konomanoasa/tree-sitter-sed"
-         :revision "v0.14.0")
+         :revision "v0.16.0")
     (sed_ere "https://github.com/konomanoasa/tree-sitter-sed"
-             :revision "v0.14.0"
+             :revision "v0.16.0"
              :source-dir "sed_ere/src"))
   "Tree-sitter grammar sources for POSIX sed.")
 
-(defcustom sed-ts-mode-regexp-syntax 'bre
-  "Default regular-expression syntax used to parse sed scripts."
-  :type '(choice
-          (const :tag "Basic regular expressions (BRE)" bre)
-          (const :tag "Extended regular expressions (ERE)" ere))
-  :safe (lambda (value) (memq value '(bre ere)))
-  :group 'sed-ts)
-
-(defun sed-ts-mode--language (syntax)
-  "Return the Tree-sitter language for SYNTAX."
-  (pcase syntax
-    ('bre 'sed)
-    ('ere 'sed_ere)
-    (_ (user-error "Unsupported sed regular expression syntax: %S"
-                   syntax))))
+(defun sed-ts-mode--language ()
+  "Return the Tree-sitter language selected by EditorConfig."
+  (let ((dialect (when buffer-file-name
+                   (gethash 'regex_dialect
+                            (editorconfig-call-get-properties-function
+                             buffer-file-name)))))
+    (pcase dialect
+      ((or 'nil "bre") 'sed)
+      ("ere" 'sed_ere)
+      (_ (user-error "Invalid EditorConfig regex_dialect: %S" dialect)))))
 
 ;;;; Syntax
 
@@ -74,35 +70,24 @@
     table)
   "Syntax table for `sed-ts-mode'.")
 
-(defvar sed-ts-mode-syntax--query-cache nil
-  "Cached syntax queries by language.")
-
 ;;;;; Syntax Queries
 
-(defun sed-ts-mode-syntax--query (language)
-  "Return the cached syntax query for LANGUAGE."
-  (let ((entry (assq language sed-ts-mode-syntax--query-cache)))
-    (or (cdr entry)
-        (let ((query
-               (treesit-query-compile
-                language
-                '((comment_function
-                   verb: (function_verb) @comment)
-                  (block_function
-                   verb: (function_verb) @delimiter)
-                  (block_function
-                   closing: (closing_brace) @delimiter))
-                t)))
-          (push (cons language query) sed-ts-mode-syntax--query-cache)
-          query))))
+(defconst sed-ts-mode-syntax--queries
+  (mapcar (lambda (source)
+            (let ((language (car source)))
+              (cons language
+                    (treesit-query-compile
+                     language
+                     '((comment_function
+                        verb: (function_verb) @comment)
+                       (block_function
+                        verb: (function_verb) @brace-open)
+                       (block_function
+                        closing: (closing_brace) @brace-close))))))
+          sed-ts-mode--grammar-sources)
+  "Compiled syntax queries by language for POSIX sed.")
 
 ;;;;; Propertization
-
-(defun sed-ts-mode-syntax--delimiter-syntax (position)
-  "Return syntax-table syntax for the delimiter at POSITION."
-  (pcase (char-after position)
-    (?{ (string-to-syntax "(}"))
-    (?} (string-to-syntax "){"))))
 
 (defun sed-ts-mode-syntax--propertize (start end)
   "Apply syntax properties between START and END."
@@ -116,19 +101,18 @@
         (syntax-ppss-flush-cache start))
       (dolist (capture (treesit-query-capture
                         (treesit-parser-root-node treesit-primary-parser)
-                        (sed-ts-mode-syntax--query
-                         (treesit-parser-language treesit-primary-parser))
+                        (alist-get (treesit-parser-language treesit-primary-parser)
+                                   sed-ts-mode-syntax--queries)
                         start end))
-        (let* ((name (car capture))
-               (node (cdr capture))
-               (position (if (eq name 'comment)
-                             (treesit-node-start node)
-                           (1- (treesit-node-end node)))))
-          (put-text-property
-           position (1+ position) 'syntax-table
-           (if (eq name 'comment)
-               (string-to-syntax "<")
-             (sed-ts-mode-syntax--delimiter-syntax position))))))))
+        (put-text-property
+         (treesit-node-start (cdr capture))
+         (treesit-node-end (cdr capture))
+         'syntax-table
+         (string-to-syntax
+          (pcase (car capture)
+            ('comment "<")
+            ('brace-open "(}")
+            ('brace-close "){"))))))))
 
 ;;;;; Setup
 
@@ -256,7 +240,7 @@
                     language)))))
 
 (defun sed-ts-mode-font-lock--settings (language)
-  "Return the font-lock settings for LANGUAGE."
+  "Return font-lock settings for LANGUAGE."
   (treesit-font-lock-rules
    :default-language language
 
@@ -329,12 +313,12 @@
 ;;;;; Setup
 
 (defun sed-ts-mode-font-lock-setup ()
-  "Configure font locking for the current buffer."
+  "Configure font lock for the current buffer."
   (setq-local treesit-font-lock-feature-list
               sed-ts-mode-font-lock--feature-list)
   (setq-local treesit-font-lock-settings
               (sed-ts-mode-font-lock--settings
-               (sed-ts-mode--language sed-ts-mode-regexp-syntax))))
+               (treesit-parser-language treesit-primary-parser))))
 
 ;;;; Imenu
 
@@ -355,14 +339,16 @@
          (and label (equal (treesit-node-type label) "label")))))
 
 (defun sed-ts-mode--defun-name (node)
-  "Return the name of the label definition NODE."
+  "Return the source name of NODE, or nil if it has no name."
   (when (sed-ts-mode--label-function-p node)
     (treesit-node-text (treesit-node-child-by-field-name node "label") t)))
 
 (defun sed-ts-mode-imenu-setup ()
   "Configure Imenu for the current buffer."
-  (setq-local treesit-defun-name-function #'sed-ts-mode--defun-name)
-  (setq-local treesit-simple-imenu-settings sed-ts-mode-imenu-settings))
+  (setq-local treesit-defun-name-function
+              #'sed-ts-mode--defun-name)
+  (setq-local treesit-simple-imenu-settings
+              sed-ts-mode-imenu-settings))
 
 ;;;; Indentation
 
@@ -396,61 +382,23 @@
     (or (treesit-ensure-installed language)
         (user-error "Tree-sitter grammar `%s' is unavailable" language))))
 
-(defun sed-ts-mode--configure ()
-  "Configure Tree-sitter features for the current buffer."
+(defun sed-ts-mode--setup ()
+  "Configure `sed-ts-mode' in the current buffer."
+  (let ((language (sed-ts-mode--language)))
+    (sed-ts-mode--ensure-grammar language)
+    (setq-local treesit-primary-parser (treesit-parser-create language)))
   (sed-ts-mode-syntax-setup)
   (sed-ts-mode-font-lock-setup)
   (sed-ts-mode-imenu-setup)
   (sed-ts-mode-indent-setup)
   (treesit-major-mode-setup))
 
-(defun sed-ts-mode--setup ()
-  "Configure `sed-ts-mode' in the current buffer."
-  (setq-local sed-ts-mode-regexp-syntax sed-ts-mode-regexp-syntax)
-  (let ((language (sed-ts-mode--language sed-ts-mode-regexp-syntax)))
-    (sed-ts-mode--ensure-grammar language)
-    (setq-local treesit-primary-parser (treesit-parser-create language)))
-  (sed-ts-mode--configure))
-
-(defun sed-ts-mode--set-regexp-syntax (syntax)
-  "Set regular-expression SYNTAX for the current buffer."
-  (let* ((language (sed-ts-mode--language syntax))
-         (parser treesit-primary-parser))
-    (if (eq language (treesit-parser-language parser))
-        (setq-local sed-ts-mode-regexp-syntax syntax)
-      (sed-ts-mode--ensure-grammar language)
-      (let ((new-parser (treesit-parser-create language)))
-        (setq-local sed-ts-mode-regexp-syntax syntax)
-        (setq-local treesit-primary-parser new-parser)
-        (sed-ts-mode--configure)
-        (treesit-parser-delete parser)
-        (save-restriction
-          (widen)
-          (syntax-ppss-flush-cache (point-min))
-          (font-lock-flush))))))
-
-(defun sed-ts-mode--reapply ()
-  "Reconfigure the buffer after local variables change."
-  (sed-ts-mode--set-regexp-syntax sed-ts-mode-regexp-syntax))
-
-(defun sed-ts-toggle-regexp ()
-  "Toggle the current buffer between BRE and ERE."
-  (interactive)
-  (unless (derived-mode-p 'sed-ts-mode)
-    (user-error "This buffer is not using sed-ts-mode"))
-  (sed-ts-mode--set-regexp-syntax
-   (if (eq sed-ts-mode-regexp-syntax 'bre) 'ere 'bre))
-  (when (called-interactively-p 'interactive)
-    (message "Using %s regular expressions"
-             (upcase (symbol-name sed-ts-mode-regexp-syntax)))))
-
 ;;;###autoload
 (define-derived-mode sed-ts-mode prog-mode "Sed-TS"
   "Major mode for editing POSIX sed."
   :syntax-table sed-ts-mode-syntax-table
   :group 'sed-ts
-  (sed-ts-mode--setup)
-  (add-hook 'hack-local-variables-hook #'sed-ts-mode--reapply nil t))
+  (sed-ts-mode--setup))
 
 ;;;###autoload
 (add-to-list 'auto-mode-alist '("\\.sed\\'" . sed-ts-mode))

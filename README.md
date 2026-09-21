@@ -1,11 +1,11 @@
 # sed-ts-mode
 
-[![CI](https://github.com/konomanoasa/sed-ts-mode/actions/workflows/ci.yml/badge.svg)](https://github.com/konomanoasa/sed-ts-mode/actions/workflows/ci.yml)
+[![CI](https://github.com/konomanoasa/sed-ts-mode/actions/workflows/ci.yaml/badge.svg)](https://github.com/konomanoasa/sed-ts-mode/actions/workflows/ci.yaml)
 
 [Tree-sitter](https://tree-sitter.github.io/tree-sitter/)-based
-[Emacs](https://www.gnu.org/software/emacs/) major mode for POSIX.1-2024 `sed`.
+[Emacs](https://www.gnu.org/software/emacs/) major mode for POSIX.1-2024 sed.
 
-## Requirements
+## Requirement
 
 - Emacs 31.1 or later
 
@@ -40,13 +40,16 @@ Supports `treesit-font-lock-level`.
 
 ## Regexp Syntax
 
-BRE is the default. Set ERE as follows.
+Select ERE for matching files in `.editorconfig`.
 
-```elisp
-(setopt sed-ts-mode-regexp-syntax 'ere)
+```ini
+[*.sed]
+regex_dialect = ere
 ```
 
-Use `M-x sed-ts-toggle-regexp` to switch the current buffer.
+Valid values are `bre` and `ere`; invalid values prevent mode activation.
+Unset properties and buffers without file names use BRE.
+Restart `sed-ts-mode` to reload settings.
 
 ## Grammar
 
