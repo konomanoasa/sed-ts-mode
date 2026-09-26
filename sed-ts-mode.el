@@ -35,19 +35,32 @@
 ;;; Code:
 
 (require 'editorconfig)
+(require 'elec-pair)
 (require 'treesit)
 
 (defgroup sed-ts nil
   "Tree-sitter mode for POSIX sed."
   :group 'languages)
 
+;;;; Grammar
+
 (defconst sed-ts-mode--grammar-sources
   '((sed "https://github.com/konomanoasa/tree-sitter-sed"
-         :revision "v0.16.0")
+         :revision "v0.18.0")
     (sed_ere "https://github.com/konomanoasa/tree-sitter-sed"
-             :revision "v0.16.0"
+             :revision "v0.18.0"
              :source-dir "sed_ere/src"))
   "Tree-sitter grammar sources for POSIX sed.")
+
+(defun sed-ts-mode--ensure-grammar (language)
+  "Ensure that the grammar for LANGUAGE is installed."
+  (let ((treesit-language-source-alist
+         (if (assq language treesit-language-source-alist)
+             treesit-language-source-alist
+           (cons (assq language sed-ts-mode--grammar-sources)
+                 treesit-language-source-alist))))
+    (or (treesit-ensure-installed language)
+        (user-error "Tree-sitter grammar `%s' is unavailable" language))))
 
 (defun sed-ts-mode--language ()
   "Return the Tree-sitter language selected by EditorConfig."
@@ -62,11 +75,20 @@
 
 ;;;; Syntax
 
-(defvar sed-ts-mode-syntax-table
+(defvar sed-ts-mode-syntax--text-table
   (let ((table (make-syntax-table prog-mode-syntax-table)))
-    (dolist (character '(?# ?\" ?\\ ?\( ?\) ?\[ ?\] ?{ ?}))
+    (dolist (character '(?# ?' ?` ?\" ?\\ ?\( ?\) ?\[ ?\] ?{ ?}))
       (modify-syntax-entry character "." table))
     (modify-syntax-entry ?\n ">" table)
+    table)
+  "Syntax table for text without a CST syntax classification.")
+
+(defvar sed-ts-mode-syntax-table
+  (let ((table (copy-syntax-table sed-ts-mode-syntax--text-table)))
+    (dolist (entry '((?\( . "()") (?\) . ")(")
+                     (?\[ . "(]") (?\] . ")[")
+                     (?{ . "(}") (?} . "){")))
+      (modify-syntax-entry (car entry) (cdr entry) table))
     table)
   "Syntax table for `sed-ts-mode'.")
 
@@ -96,9 +118,9 @@
       (widen)
       (when (and (= start accessible-start)
                  (> accessible-start (point-min)))
-        (remove-text-properties (point-min) start '(syntax-table nil))
         (setq start (point-min))
         (syntax-ppss-flush-cache start))
+      (put-text-property start end 'syntax-table sed-ts-mode-syntax--text-table)
       (dolist (capture (treesit-query-capture
                         (treesit-parser-root-node treesit-primary-parser)
                         (alist-get (treesit-parser-language treesit-primary-parser)
@@ -116,7 +138,7 @@
 
 ;;;;; Setup
 
-(defun sed-ts-mode-syntax-setup ()
+(defun sed-ts-mode-syntax--setup ()
   "Configure syntax handling for the current buffer."
   (setq-local syntax-propertize-function
               #'sed-ts-mode-syntax--propertize)
@@ -126,6 +148,39 @@
   (setq-local comment-end "")
   (setq-local comment-start-skip "#[[:blank:]]*")
   (setq-local comment-use-syntax t))
+
+;;;; Electric Pair
+
+(defun sed-ts-mode-electric-pair--newline-context-p ()
+  "Return non-nil for a CST block delimiter pair around the newline."
+  (when (and (eq (char-before) ?\n)
+             (>= (- (point) 2) (point-min))
+             (< (point) (point-max)))
+    (let* ((opening (treesit-node-at (- (point) 2) treesit-primary-parser))
+           (closing (treesit-node-at (point) treesit-primary-parser))
+           (owner (treesit-node-parent opening)))
+      (and (= (treesit-node-start opening) (- (point) 2))
+           (= (treesit-node-end opening) (1- (point)))
+           (= (treesit-node-start closing) (point))
+           (= (treesit-node-end closing) (1+ (point)))
+           (equal (treesit-node-type owner) "block_function")
+           (treesit-node-eq opening (treesit-node-child-by-field-name owner "verb"))
+           (treesit-node-eq closing (treesit-node-child-by-field-name owner "closing"))))))
+
+(defun sed-ts-mode-electric-pair--setup ()
+  "Configure electric pairing for the current buffer."
+  (let ((pairs '((?\( . ?\)) (?\[ . ?\]) (?{ . ?})))
+        (table (copy-syntax-table (syntax-table))))
+    (setq-local electric-pair-pairs (append electric-pair-pairs pairs))
+    (dolist (pair pairs)
+      (unless (eq (cdr (assq (car pair) electric-pair-pairs)) (cdr pair))
+        (modify-syntax-entry (car pair) "." table)))
+    (set-syntax-table table))
+  (let ((setting electric-pair-open-newline-between-pairs))
+    (setq-local electric-pair-open-newline-between-pairs
+                (lambda ()
+                  (and (if (functionp setting) (funcall setting) setting)
+                       (sed-ts-mode-electric-pair--newline-context-p))))))
 
 ;;;; Font Lock
 
@@ -223,9 +278,6 @@
          (back_close_parenthesis)
          (back_open_brace)
          (back_close_brace)] @font-lock-bracket-face
-         [(back_bar)
-          (back_plus)
-          (back_qm)] @font-lock-operator-face
          (backreference) @font-lock-constant-face))
      ('sed_ere
       '([(open_parenthesis)
@@ -312,7 +364,7 @@
 
 ;;;;; Setup
 
-(defun sed-ts-mode-font-lock-setup ()
+(defun sed-ts-mode-font-lock--setup ()
   "Configure font lock for the current buffer."
   (setq-local treesit-font-lock-feature-list
               sed-ts-mode-font-lock--feature-list)
@@ -320,35 +372,47 @@
               (sed-ts-mode-font-lock--settings
                (treesit-parser-language treesit-primary-parser))))
 
-;;;; Imenu
+;;;; Navigation
 
-(defconst sed-ts-mode--label-function-regexp
+(defconst sed-ts-mode-navigation--label-function-regexp
   "^label_function$"
   "Regexp matching POSIX sed label definitions.")
 
-(defconst sed-ts-mode-imenu-settings
-  `(("Label" ,sed-ts-mode--label-function-regexp
-     sed-ts-mode--label-function-p nil))
-  "Tree-sitter Imenu settings for POSIX sed.")
-
-(defun sed-ts-mode--label-function-p (node)
+(defun sed-ts-mode-navigation--defun-p (node)
   "Return non-nil when NODE is a named POSIX sed label definition."
   (and (treesit-node-match-p
-        node sed-ts-mode--label-function-regexp)
+        node sed-ts-mode-navigation--label-function-regexp)
        (let ((label (treesit-node-child-by-field-name node "label")))
          (and label (equal (treesit-node-type label) "label")))))
 
-(defun sed-ts-mode--defun-name (node)
+(defconst sed-ts-mode-navigation--settings
+  (let ((things '((sexp (or "^editing_command$" "^block_function$"))
+                  (defun sed-ts-mode-navigation--defun-p))))
+    (list (cons 'sed things) (cons 'sed_ere things)))
+  "Tree-sitter thing definitions for POSIX sed.")
+
+(defun sed-ts-mode-navigation--setup ()
+  "Configure navigation for the current buffer."
+  (setq-local treesit-thing-settings sed-ts-mode-navigation--settings))
+
+;;;; Imenu
+
+(defun sed-ts-mode-imenu--name (node)
   "Return the source name of NODE, or nil if it has no name."
-  (when (sed-ts-mode--label-function-p node)
+  (when (sed-ts-mode-navigation--defun-p node)
     (treesit-node-text (treesit-node-child-by-field-name node "label") t)))
 
-(defun sed-ts-mode-imenu-setup ()
+(defconst sed-ts-mode-imenu--settings
+  `(("Label" ,sed-ts-mode-navigation--label-function-regexp
+     sed-ts-mode-navigation--defun-p nil))
+  "Tree-sitter Imenu settings for POSIX sed.")
+
+(defun sed-ts-mode-imenu--setup ()
   "Configure Imenu for the current buffer."
   (setq-local treesit-defun-name-function
-              #'sed-ts-mode--defun-name)
+              #'sed-ts-mode-imenu--name)
   (setq-local treesit-simple-imenu-settings
-              sed-ts-mode-imenu-settings))
+              sed-ts-mode-imenu--settings))
 
 ;;;; Indentation
 
@@ -357,40 +421,32 @@
   :type 'natnum
   :group 'sed-ts)
 
-(defconst sed-ts-mode-indent-rules
+(defconst sed-ts-mode-indent--rules
   (let ((rules '(((node-is "closing_brace") parent-bol 0)
                  ((n-p-gp nil "command_list" "block_function")
-                  standalone-parent sed-ts-mode-indent-offset)
+                  parent-bol sed-ts-mode-indent-offset)
                  ((parent-is "command_list") column-0 0))))
     (list (cons 'sed rules) (cons 'sed_ere rules)))
   "Tree-sitter indentation rules for POSIX sed.")
 
-(defun sed-ts-mode-indent-setup ()
+(defun sed-ts-mode-indent--setup ()
   "Configure indentation for the current buffer."
   (setq-local treesit-simple-indent-rules
-              sed-ts-mode-indent-rules))
+              sed-ts-mode-indent--rules))
 
 ;;;; Mode
-
-(defun sed-ts-mode--ensure-grammar (language)
-  "Ensure that the grammar for LANGUAGE is installed."
-  (let ((treesit-language-source-alist
-         (if (assq language treesit-language-source-alist)
-             treesit-language-source-alist
-           (cons (assq language sed-ts-mode--grammar-sources)
-                 treesit-language-source-alist))))
-    (or (treesit-ensure-installed language)
-        (user-error "Tree-sitter grammar `%s' is unavailable" language))))
 
 (defun sed-ts-mode--setup ()
   "Configure `sed-ts-mode' in the current buffer."
   (let ((language (sed-ts-mode--language)))
     (sed-ts-mode--ensure-grammar language)
     (setq-local treesit-primary-parser (treesit-parser-create language)))
-  (sed-ts-mode-syntax-setup)
-  (sed-ts-mode-font-lock-setup)
-  (sed-ts-mode-imenu-setup)
-  (sed-ts-mode-indent-setup)
+  (sed-ts-mode-syntax--setup)
+  (sed-ts-mode-electric-pair--setup)
+  (sed-ts-mode-font-lock--setup)
+  (sed-ts-mode-navigation--setup)
+  (sed-ts-mode-imenu--setup)
+  (sed-ts-mode-indent--setup)
   (treesit-major-mode-setup))
 
 ;;;###autoload
