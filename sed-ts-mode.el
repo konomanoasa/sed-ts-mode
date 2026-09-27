@@ -36,6 +36,7 @@
 
 (require 'editorconfig)
 (require 'elec-pair)
+(require 'newcomment)
 (require 'treesit)
 
 (defgroup sed-ts nil
@@ -143,11 +144,55 @@
   (setq-local syntax-propertize-function
               #'sed-ts-mode-syntax--propertize)
   (add-hook 'syntax-propertize-extend-region-functions
-            #'syntax-propertize-wholelines nil t)
+            #'syntax-propertize-wholelines nil t))
+
+;;;; Comment Commands
+
+(defun sed-ts-mode-comment--uncomment-region (beg end &optional arg)
+  "Uncomment BEG through END using syntax classified before editing.
+Pass ARG to `uncomment-region-default'."
+  (syntax-propertize end)
+  (unwind-protect
+      (let ((syntax-propertize-function nil))
+        (uncomment-region-default beg end arg))
+    (syntax-ppss-flush-cache beg)))
+
+(defun sed-ts-mode-comment--insert-comment ()
+  "Insert a standalone comment at a line boundary."
+  (let* ((bol (line-beginning-position))
+         (position (max bol (1- (point))))
+         (start
+          (save-restriction
+            (widen)
+            (let* ((command (treesit-parent-until
+                             (treesit-node-at position treesit-primary-parser)
+                             "^editing_command$"))
+                   (function (treesit-node-child-by-field-name command "function")))
+              (when (and command
+                         (< (treesit-node-start command) bol)
+                         (> (treesit-node-end command) bol)
+                         (not (equal (treesit-node-type (treesit-node-child function 0 t))
+                                     "block_function")))
+                (treesit-node-start command))))))
+    (when start
+      (when (< start (point-min))
+        (user-error "The command starts outside the accessible region"))
+      (goto-char start)))
+  (beginning-of-line)
+  (if (looking-at-p "[ \t]*$")
+      (delete-horizontal-space)
+    (save-excursion (insert "\n")))
+  (insert (comment-padright comment-start))
+  (indent-according-to-mode))
+
+(defun sed-ts-mode-comment--setup ()
+  "Configure comment commands for the current buffer."
   (setq-local comment-start "# ")
   (setq-local comment-end "")
   (setq-local comment-start-skip "#[[:blank:]]*")
-  (setq-local comment-use-syntax t))
+  (setq-local comment-use-syntax t)
+  (setq-local uncomment-region-function #'sed-ts-mode-comment--uncomment-region)
+  (setq-local comment-insert-comment-function #'sed-ts-mode-comment--insert-comment))
 
 ;;;; Electric Pair
 
@@ -393,7 +438,8 @@
 
 (defun sed-ts-mode-navigation--setup ()
   "Configure navigation for the current buffer."
-  (setq-local treesit-thing-settings sed-ts-mode-navigation--settings))
+  (setq-local treesit-thing-settings
+              sed-ts-mode-navigation--settings))
 
 ;;;; Imenu
 
@@ -442,6 +488,7 @@
     (sed-ts-mode--ensure-grammar language)
     (setq-local treesit-primary-parser (treesit-parser-create language)))
   (sed-ts-mode-syntax--setup)
+  (sed-ts-mode-comment--setup)
   (sed-ts-mode-electric-pair--setup)
   (sed-ts-mode-font-lock--setup)
   (sed-ts-mode-navigation--setup)

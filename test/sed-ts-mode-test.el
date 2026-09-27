@@ -282,17 +282,6 @@
 
 ;;;; Syntax
 
-(ert-deftest sed-ts-mode-comments-and-uncomments ()
-  (with-temp-buffer
-    (insert "p\n")
-    (sed-ts-mode)
-    (comment-region (point-min) (point-max))
-    (should (equal (buffer-substring-no-properties (point-min) (point-max))
-                   "# p\n"))
-    (uncomment-region (point-min) (point-max))
-    (should (equal (buffer-substring-no-properties (point-min) (point-max))
-                   "p\n"))))
-
 (ert-deftest sed-ts-mode-classifies-delimiters ()
   (dolist (case
            '((bre "s/\\(a[bc]\\)\\{2\\}/x/"
@@ -332,18 +321,20 @@
          "r #file\n"
          "r \"file\n"
          "# after-quote\n")
-      (dolist (case '(("#n directive" "#" 1)
-                      ("#" "#" 1)
-                      ("# plain" "#" 1)
-                      ("p;# trailing" "#" 1)
-                      ("# after-quote" "#" 1)))
-        (should (sed-ts-mode-test--comment-p (nth 1 case) (nth 2 case) (car case))))
-      (dolist (case '(("s/#/x/" "#" 1)
-                      ("s/x/#/" "#" 1)
-                      ("y/#/x/" "#" 1)
-                      ("# text" "#" 1)
-                      ("r #file" "#" 1)))
-        (should-not (sed-ts-mode-test--comment-p (nth 1 case) (nth 2 case) (car case)))))
+      (pcase-dolist (`(,line ,fragment ,offset)
+                     '(("#n directive" "#" 1)
+                       ("#" "#" 1)
+                       ("# plain" "#" 1)
+                       ("p;# trailing" "#" 1)
+                       ("# after-quote" "#" 1)))
+        (should (sed-ts-mode-test--comment-p fragment offset line)))
+      (pcase-dolist (`(,line ,fragment ,offset)
+                     '(("s/#/x/" "#" 1)
+                       ("s/x/#/" "#" 1)
+                       ("y/#/x/" "#" 1)
+                       ("# text" "#" 1)
+                       ("r #file" "#" 1)))
+        (should-not (sed-ts-mode-test--comment-p fragment offset line))))
     (dolist (source '("# note" "#"))
       (sed-ts-mode-test--with-script syntax source
         (syntax-propertize (point-max))
@@ -358,9 +349,116 @@
           (should (= (syntax-class (syntax-after position)) 1))
           (should-not (nth 3 (syntax-ppss (1+ position)))))))))
 
+;;;; Comment Commands
+
+(ert-deftest sed-ts-mode-comments-and-uncomments ()
+  (with-temp-buffer
+    (insert "p\n")
+    (sed-ts-mode)
+    (comment-region (point-min) (point-max))
+    (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                   "# p\n"))
+    (uncomment-region (point-min) (point-max))
+    (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                   "p\n"))))
+
+(ert-deftest sed-ts-mode-uncomments-multiline-source ()
+  (dolist (case
+           '(("a\\\n# text\n" "# a\\\n# # text\n")
+             ("s/a/one\\\ntwo/\n" "# s/a/one\\\n# two/\n")))
+    (dolist (syntax '(bre ere))
+      (sed-ts-mode-test--with-script syntax (car case)
+        (let ((state (sed-ts-mode-test--buffer-state)))
+          (comment-or-uncomment-region (point-min) (point-max))
+          (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                         (cadr case)))
+          (comment-or-uncomment-region (point-min) (point-max))
+          (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                         (car case)))
+          (should (equal (sed-ts-mode-test--buffer-state) state)))))))
+
+(ert-deftest sed-ts-mode-inserts-standalone-comments ()
+  (dolist (syntax '(bre ere))
+    (pcase-dolist (`(,source ,line ,expected)
+                   '(("p" 1 "# \np")
+                     ("{\n  p\n}\n" 2 "{\n  # \n  p\n}\n")
+                     ("a\\\ntext\n" 2 "# \na\\\ntext\n")
+                     ("s/a/x\\\ny/\n" 2 "# \ns/a/x\\\ny/\n")
+                     ("{\n  a\\\ntext\n}\n" 3 "{\n  # \n  a\\\ntext\n}\n")
+                     ("{\n  p\n}\n" 3 "{\n  p\n  # \n}\n")
+                     ("" 1 "# ")
+                     ("  " 1 "# ")))
+      (sed-ts-mode-test--with-script syntax source
+        (setq-local indent-tabs-mode nil)
+        (goto-char (point-min))
+        (forward-line (1- line))
+        (end-of-line)
+        (call-interactively (key-binding (kbd "M-;")))
+        (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                       expected))
+        (should (nth 4 (syntax-ppss))))))
+  (sed-ts-mode-test--with-script 'bre "a\\\ntext\n"
+    (narrow-to-region 4 (point-max))
+    (goto-char (point-max))
+    (forward-char -1)
+    (should-error (comment-dwim nil) :type 'user-error)
+    (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                   "text\n"))))
+
 ;;;; Electric Pair
 
-(ert-deftest sed-ts-mode-opens-indented-line-between-braces ()
+(ert-deftest sed-ts-mode-supplies-electric-pairs ()
+  (let ((electric-pair-pairs '((?% . ?%)))
+        (electric-pair-mode nil))
+    (dolist (syntax '(bre ere))
+      (pcase-dolist (`(,prefix ,opening ,expected)
+                     '(("" ?{ "{}")
+                       ("s/" ?\( "s/()")
+                       ("s/" ?\[ "s/[]")))
+        (ert-info ((format "%S / %c" prefix opening))
+          (sed-ts-mode-test--with-script syntax prefix
+
+            (should-not electric-pair-mode)
+            (should (local-variable-p 'electric-pair-pairs))
+            (should (equal (assq ?% electric-pair-pairs) '(?% . ?%)))
+            (electric-pair-local-mode 1)
+            (let ((last-command-event opening)) (self-insert-command 1))
+            (should (equal (buffer-string) expected))
+            (should (= (point) (1- (point-max))))))))
+    (should (equal electric-pair-pairs '((?% . ?%)))))
+  (let ((electric-pair-pairs '((?{ . ?>))))
+    (dolist (syntax '(bre ere))
+      (pcase-dolist (`(,prefix ,opening ,expected)
+                     '(("" ?{ "{>")))
+        (sed-ts-mode-test--with-script syntax prefix
+
+          (electric-pair-local-mode 1)
+          (let ((last-command-event opening)) (self-insert-command 1))
+          (should (equal (buffer-string) expected))
+          (should (= (point) (1- (point-max)))))))
+    (should (equal electric-pair-pairs '((?{ . ?>))))))
+
+(ert-deftest sed-ts-mode-respects-pair-newline-preferences ()
+  (dolist (syntax '(bre ere))
+    (let ((calls 0))
+      (pcase-dolist (`(,setting ,expected)
+                     (list (list nil "{\n}")
+                           (list t "{\n\n}")
+                           (list (lambda () (setq calls (1+ calls)) nil) "{\n}")
+                           (list (lambda () (setq calls (1+ calls)) t) "{\n\n}")))
+        (setq calls 0)
+        (let ((electric-pair-open-newline-between-pairs setting))
+          (sed-ts-mode-test--with-script syntax "{}"
+
+            (electric-indent-local-mode -1)
+            (electric-pair-local-mode 1)
+            (goto-char 2)
+            (call-interactively (key-binding (kbd "RET")))
+            (should (equal (buffer-string) expected)))
+          (should (eq (> calls 0) (functionp setting)))
+          (should (eq electric-pair-open-newline-between-pairs setting)))))))
+
+(ert-deftest sed-ts-mode-pairs-delimiters-and-indents-on-return ()
   (dolist (syntax '(bre ere))
     (pcase-dolist (`(,prefix ,suffix ,offset ,expand ,expected ,column)
                    '(("1,2" "" 2 t "1,2{\n  \n}" 2)
@@ -385,33 +483,7 @@
               (should (= (line-number-at-pos)
                          (1+ (length (split-string prefix "\n"))))))))))))
 
-(ert-deftest sed-ts-mode-supplies-electric-pairs ()
-  (let ((electric-pair-pairs '((?\" . ?\")))
-        (electric-pair-mode nil))
-    (dolist (syntax '(bre ere))
-      (pcase-dolist (`(,source ,character ,expected)
-                     '(("" ?{ "{}")
-                       ("s/" ?\( "s/()")
-                       ("s/" ?\[ "s/[]")))
-        (sed-ts-mode-test--with-script syntax source
-          (should-not electric-pair-mode)
-          (should (local-variable-p 'electric-pair-pairs))
-          (electric-pair-local-mode 1)
-          (let ((last-command-event character))
-            (self-insert-command 1))
-          (should (equal (buffer-string) expected))
-          (should (= (point) (1- (point-max)))))))
-    (should (equal electric-pair-pairs '((?\" . ?\")))))
-  (let ((electric-pair-pairs '((?{ . ?>))))
-    (dolist (syntax '(bre ere))
-      (sed-ts-mode-test--with-script syntax ""
-        (should (equal (assq ?{ electric-pair-pairs) '(?{ . ?>)))
-        (electric-pair-local-mode 1)
-        (let ((last-command-event ?{)) (self-insert-command 1))
-        (should (equal (buffer-substring-no-properties (point-min) (point-max))
-                       "{>"))))))
-
-(ert-deftest sed-ts-mode-restricts-pair-newlines-to-blocks ()
+(ert-deftest sed-ts-mode-restricts-pair-newlines-to-cst-contexts ()
   (let ((electric-pair-open-newline-between-pairs t))
     (dolist (syntax '(bre ere))
       (pcase-dolist (`(,before ,after ,expected)
@@ -433,22 +505,6 @@
             (call-interactively (key-binding (kbd "RET")))
             (should (equal (buffer-substring-no-properties (point-min) (point-max))
                            expected))))))))
-
-(ert-deftest sed-ts-mode-respects-pair-newline-preferences ()
-  (dolist (syntax '(bre ere))
-    (dolist (enabled '(nil t))
-      (let* ((calls 0)
-             (setting (lambda () (setq calls (1+ calls)) enabled))
-             (electric-pair-open-newline-between-pairs setting))
-        (sed-ts-mode-test--with-script syntax "{}"
-          (electric-indent-local-mode -1)
-          (electric-pair-local-mode 1)
-          (goto-char 2)
-          (call-interactively (key-binding (kbd "RET")))
-          (should (equal (buffer-substring-no-properties (point-min) (point-max))
-                         (if enabled "{\n\n}" "{\n}")))
-          (should (> calls 0)))
-        (should (eq electric-pair-open-newline-between-pairs setting))))))
 
 ;;;; Font Lock
 
@@ -714,7 +770,6 @@
                 (ert-info ((treesit-node-type (cdr capture)))
                   (should (= (treesit-node-child-count (cdr capture)) 0)))))))))))
 
-
 ;;;; Navigation
 
 (ert-deftest sed-ts-mode-navigates-commands-and-blocks ()
@@ -797,10 +852,11 @@
 ;;;; Imenu
 
 (ert-deftest sed-ts-mode-indexes-definitions ()
-  (dolist (entry '((bre . sed) (ere . sed_ere)))
+  (pcase-dolist (`(,syntax . ,language)
+                 '((bre . sed) (ere . sed_ere)))
 
     (sed-ts-mode-test--with-script
-        (car entry) "b again\n:again\nt done\n:done\n:\n"
+        syntax "b again\n:again\nt done\n:done\n:\n"
       (let ((index (funcall imenu-create-index-function)))
         (should (equal (mapcar #'car index) '("Label")))
         (setq index (cdr (assoc "Label" index)))
@@ -810,7 +866,7 @@
           (mapcar (lambda (item) (marker-position (cdr item))) index)
           (list (sed-ts-mode-test--position ":" ":again")
                 (sed-ts-mode-test--position ":" ":done")))))
-      (let* ((root (treesit-buffer-root-node (cdr entry)))
+      (let* ((root (treesit-buffer-root-node language))
              (capture (car (treesit-query-capture
                             root '((label_function) @label))))
              (definition (cdr capture)))
