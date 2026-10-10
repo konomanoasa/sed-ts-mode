@@ -29,7 +29,7 @@
 (require 'newcomment)
 (require 'sed-ts-mode)
 
-(dolist (language '(sed sed_ere))
+(dolist (language '(gsed gsed_ere sed sed_ere))
   (unless (treesit-ready-p language t)
     (error "The %s grammar is required to run the tests" language)))
 
@@ -69,24 +69,30 @@
     (ert-info ((format "%S: %S" line fragment))
       (should (eq (sed-ts-mode-test--face fragment nil line) face)))))
 
-(defun sed-ts-mode-test--language (syntax)
-  (pcase syntax ('bre 'sed) ('ere 'sed_ere)))
-
-(defmacro sed-ts-mode-test--with-regexp-syntax (syntax &rest body)
-  (declare (indent 1) (debug (form body)))
+(defmacro sed-ts-mode-test--with-settings (posix ere &rest body)
+  (declare (indent 2) (debug (form form body)))
   `(let ((default-directory
           (file-name-as-directory (make-temp-file "sed-ts-mode-" t))))
      (unwind-protect
          (progn
            (with-temp-file (expand-file-name ".editorconfig")
-             (insert "root = true\n[*.sed]\nregex_dialect = "
-                     (symbol-name ,syntax) "\n"))
+             (insert "root = true\n[*]\nposix = " ,posix "\nere = " ,ere "\n"))
            ,@body)
        (delete-directory default-directory t))))
 
+(defmacro sed-ts-mode-test--with-language (language &rest body)
+  (declare (indent 1) (debug (form body)))
+  (let ((selected (make-symbol "language")))
+    `(let ((,selected ,language))
+       (ert-info ((format "Language: %s" ,selected))
+         (sed-ts-mode-test--with-settings
+             (if (memq ,selected '(sed sed_ere)) "true" "false")
+             (if (memq ,selected '(sed_ere gsed_ere)) "true" "false")
+           ,@body)))))
+
 (defmacro sed-ts-mode-test--with-script (syntax source &rest body)
   (declare (indent 2) (debug (form form body)))
-  `(sed-ts-mode-test--with-regexp-syntax ,syntax
+  `(sed-ts-mode-test--with-language ,syntax
      (with-temp-buffer
        (setq buffer-file-name (expand-file-name "script.sed"))
        (insert ,source)
@@ -166,106 +172,120 @@
     (insert "p\n")
     (sed-ts-mode)
     (should (eq major-mode 'sed-ts-mode))
-    (should (eq (treesit-parser-language treesit-primary-parser) 'sed))
+    (should (eq (treesit-parser-language treesit-primary-parser) 'gsed))
     (should (equal (treesit-node-type (treesit-parser-root-node treesit-primary-parser))
                    "script"))
     (sed-ts-mode)
     (should (equal (treesit-parser-list) (list treesit-primary-parser)))))
 
-(ert-deftest sed-ts-mode-selects-editorconfig-dialects-on-file-visits ()
+(ert-deftest sed-ts-mode-ensures-only-selected-grammar ()
+  (let ((ensure (symbol-function 'treesit-ensure-installed)) received)
+    (unwind-protect
+        (progn
+          (fset 'treesit-ensure-installed
+                (lambda (language) (push language received) t))
+          (dolist (language '(gsed gsed_ere sed sed_ere))
+            (setq received nil)
+            (sed-ts-mode-test--with-script language "p\n"
+              (should (equal received (list language))))))
+      (fset 'treesit-ensure-installed ensure))))
+
+;;;; Mode Selection
+
+(ert-deftest sed-ts-mode-selects-editorconfig-conditions-on-file-visits ()
   (dolist (enabled '(nil t))
-    (pcase-dolist (`(,value ,language)
-                   '(("bre" sed) ("ere" sed_ere) (nil sed) ("unset" sed)))
+    (pcase-dolist (`(,posix ,ere ,language)
+                   '(("false" "false" gsed) ("false" "true" gsed_ere)
+                     ("true" "false" sed) ("true" "true" sed_ere)
+                     ("unset" "unset" gsed)))
+      (let ((file "script.sed"))
+        (sed-ts-mode-test--with-settings posix ere
+          (with-temp-file (expand-file-name file) (insert "/a+/p\n"))
+          (let ((previous editorconfig-mode))
+            (unwind-protect
+                (progn
+                  (editorconfig-mode (if enabled 1 -1))
+                  (with-current-buffer (find-file-noselect (expand-file-name file))
+                    (unwind-protect
+                        (progn
+                          (should (eq major-mode 'sed-ts-mode))
+                          (should (eq (treesit-parser-language
+                                       treesit-primary-parser) language))
+                          (should (eq editorconfig-mode enabled)))
+                      (kill-buffer))))
+              (editorconfig-mode (if previous 1 -1)))))))))
 
-      (sed-ts-mode-test--with-regexp-syntax 'ere
-        (with-temp-file (expand-file-name ".editorconfig")
-          (insert "root = true\n[*.sed]\n")
-          (when value (insert "regex_dialect = " value "\n")))
-        (with-temp-file (expand-file-name "script.sed") (insert "/a+/p\n"))
-        (let ((previous editorconfig-mode))
-          (unwind-protect
-              (progn
-                (editorconfig-mode (if enabled 1 -1))
-                (with-current-buffer (find-file-noselect
-                                      (expand-file-name "script.sed"))
-                  (unwind-protect
-                      (progn
-                        (should (eq major-mode 'sed-ts-mode))
-                        (should (eq (treesit-parser-language
-                                     treesit-primary-parser) language))
-                        (should (eq editorconfig-mode enabled)))
-                    (kill-buffer))))
-            (editorconfig-mode (if previous 1 -1))))))))
-
-(ert-deftest sed-ts-mode-defaults-to-bre-without-a-file-name ()
-  (sed-ts-mode-test--with-regexp-syntax 'ere
-    (with-temp-buffer
-      (insert "/a+/p\n")
-      (sed-ts-mode)
-      (should-not buffer-file-name)
-      (should (eq (treesit-parser-language treesit-primary-parser) 'sed)))))
-
-(ert-deftest sed-ts-mode-rejects-invalid-editorconfig-dialects ()
-  (dolist (value '(pcre ERE invalid))
-    (sed-ts-mode-test--with-regexp-syntax value
+(ert-deftest sed-ts-mode-defaults-to-gnu-bre ()
+  (dolist (file '(nil "script.sed"))
+    (sed-ts-mode-test--with-settings "unset" "unset"
       (with-temp-buffer
-        (setq buffer-file-name (expand-file-name "script.sed"))
-        (let ((error-data (should-error (sed-ts-mode) :type 'user-error)))
-          (should (equal (error-message-string error-data)
-                         (format "Invalid EditorConfig regex_dialect: %S"
-                                 (symbol-name value)))))
-        (should-not (treesit-parser-list nil nil t))))))
+        (setq buffer-file-name (and file (expand-file-name file)))
+        (insert "/a+/p\n")
+        (sed-ts-mode)
+        (should (eq (treesit-parser-language treesit-primary-parser) 'gsed)))))
+  (sed-ts-mode-test--with-language 'sed_ere
+    (with-temp-buffer
+      (sed-ts-mode)
+      (should (eq (treesit-parser-language treesit-primary-parser) 'gsed)))))
+
+(ert-deftest sed-ts-mode-rejects-invalid-editorconfig-conditions ()
+  (dolist (property '(posix ere))
+    (dolist (value '("1" "yes" "TRUE" "bre" "invalid"))
+      (sed-ts-mode-test--with-settings
+          (if (eq property 'posix) value "false")
+          (if (eq property 'ere) value "false")
+        (with-temp-buffer
+          (setq buffer-file-name (expand-file-name "script.sed"))
+          (let ((error-data (should-error (sed-ts-mode) :type 'user-error)))
+            (should (equal (error-message-string error-data)
+                           (format "Invalid EditorConfig %s: %S (expected true or false)"
+                                   property value))))
+          (should-not (treesit-parser-list nil nil t)))))))
 
 (ert-deftest sed-ts-mode-reloads-editorconfig-only-on-mode-restart ()
   (let ((treesit-font-lock-level 4))
-    (sed-ts-mode-test--with-script 'bre "/a+/p\n"
-      (font-lock-ensure)
-      (should (eq (sed-ts-mode-test--face "+" nil "/a+/p")
-                  'font-lock-regexp-face))
-      (pcase-dolist (`(,value ,language ,face)
-                     '(("ere" sed_ere font-lock-operator-face)
-                       ("bre" sed font-lock-regexp-face)))
+    (sed-ts-mode-test--with-script 'gsed "/a+/p\n"
+      (pcase-dolist (`(,posix ,ere ,language ,face)
+                     '(("true" "true" sed_ere font-lock-operator-face)
+                       ("false" "true" gsed_ere font-lock-operator-face)
+                       ("true" "false" sed font-lock-regexp-face)
+                       ("false" "false" gsed font-lock-regexp-face)))
         (let ((parser treesit-primary-parser))
           (with-temp-file (expand-file-name ".editorconfig")
-            (insert "root = true\n[*.sed]\nregex_dialect = " value "\n"))
+            (insert "root = true\n[*]\nposix = " posix "\nere = " ere "\n"))
           (font-lock-flush)
           (font-lock-ensure)
           (should (eq treesit-primary-parser parser))
           (sed-ts-mode)
           (font-lock-ensure)
-          (should (eq (treesit-parser-language treesit-primary-parser)
-                      language))
+          (should (eq (treesit-parser-language treesit-primary-parser) language))
           (should (equal (treesit-parser-list) (list treesit-primary-parser)))
-          (should (eq (sed-ts-mode-test--face "+" nil "/a+/p") face))
-          (should (equal (buffer-substring-no-properties (point-min) (point-max))
-                         "/a+/p\n")))))))
-
-;;;; Mode Selection
+          (should (eq (sed-ts-mode-test--face "+") face)))))))
 
 (ert-deftest sed-ts-mode-selects-files ()
-  (let (patterns)
-    (dolist (entry auto-mode-alist)
-      (when (eq (cdr entry) 'sed-ts-mode)
-        (push (car entry) patterns)))
-    (should (equal patterns '("\\.sed\\'"))))
-  (sed-ts-mode-test--with-regexp-syntax 'bre
-    (with-temp-buffer
-      (setq buffer-file-name (expand-file-name "example.sed"))
-      (set-auto-mode)
-      (should (eq major-mode 'sed-ts-mode)))))
-
-(ert-deftest sed-ts-mode-selects-interpreters ()
-  (should (equal (alist-get "sed" interpreter-mode-alist nil nil #'equal)
-                 'sed-ts-mode))
-  (sed-ts-mode-test--with-regexp-syntax 'bre
-    (dolist (shebang '("#!/usr/bin/sed -f\n"
-                       "#!/usr/bin/env sed -f\n"
-                       "#!/usr/bin/env -S sed -f\n"))
+  (pcase-dolist (`(,file ,selected)
+                 '(("example.sed" t) ("example.gsed" nil)))
+    (sed-ts-mode-test--with-settings "unset" "unset"
       (with-temp-buffer
-        (setq buffer-file-name "/tmp/example")
-        (insert shebang "p\n")
+        (setq buffer-file-name (expand-file-name file))
         (set-auto-mode)
-        (should (eq major-mode 'sed-ts-mode))))))
+        (should (eq (eq major-mode 'sed-ts-mode) selected))
+        (when selected
+          (should (eq (treesit-parser-language treesit-primary-parser) 'gsed)))))))
+
+(ert-deftest sed-ts-mode-selects-interpreters-without-interpreting-options ()
+  (should (eq (alist-get "sed" interpreter-mode-alist nil nil #'equal)
+              'sed-ts-mode))
+  (pcase-dolist (`(,interpreter ,selected) '(("sed" t) ("gsed" nil)))
+    (dolist (prefix '("#!/usr/bin/" "#!/usr/bin/env " "#!/usr/bin/env -S "))
+      (sed-ts-mode-test--with-settings "unset" "unset"
+        (with-temp-buffer
+          (setq buffer-file-name (expand-file-name "script"))
+          (insert prefix interpreter " -E --posix -f\np\n")
+          (set-auto-mode)
+          (should (eq (eq major-mode 'sed-ts-mode) selected))
+          (when selected
+            (should (eq (treesit-parser-language treesit-primary-parser) 'gsed))))))))
 
 (ert-deftest sed-ts-mode-generates-autoloads ()
   (let ((output (make-temp-file "sed-ts-mode-loaddefs-"))
@@ -282,12 +302,30 @@
 
 ;;;; Syntax
 
+(ert-deftest sed-ts-mode-classifies-gnu-delimiters-and-source-escapes ()
+  (pcase-dolist (`(,language ,regexp)
+                 '((gsed "s/\\(a[bc]\\)\\{2\\}/x/")
+                   (gsed_ere "s/(a[bc]){2}/x/")))
+    (sed-ts-mode-test--with-script language (concat "{\n" regexp "\n}\n")
+      (should (= (sed-ts-mode-test--syntax-class "{") 4))
+      (should (= (sed-ts-mode-test--syntax-class "}" nil "}") 5))
+      (should (= (scan-sexps 1 1) (1+ (sed-ts-mode-test--position "}" "}"))))
+      (dotimes (offset (length regexp))
+        (let ((position (+ 3 offset)))
+          (when (memq (char-after position) '(?\( ?\) ?\[ ?\] ?{ ?} ?\\))
+            (should (= (syntax-class (syntax-after position)) 1)))))))
+  (dolist (language '(gsed gsed_ere))
+    (sed-ts-mode-test--with-script language "s/\\x5ba\\x5d/\\U&/\n"
+      (syntax-propertize (point-max))
+      (should (= (sed-ts-mode-test--syntax-class "\\x5b") 1))
+      (should-not (nth 3 (syntax-ppss (point-max)))))))
+
 (ert-deftest sed-ts-mode-classifies-delimiters ()
   (dolist (case
-           '((bre "s/\\(a[bc]\\)\\{2\\}/x/"
+           '((sed "s/\\(a[bc]\\)\\{2\\}/x/"
                   ("\\(" "\\)" "[" "]" "\\{" "\\}"))
-             (ere "s/(a[bc]){2}/x/"
-                  ("(" ")" "[" "]" "{" "}"))))
+             (sed_ere "s/(a[bc]){2}/x/"
+                      ("(" ")" "[" "]" "{" "}"))))
     (pcase-let ((`(,syntax ,regexp ,delimiters) case))
 
       (sed-ts-mode-test--with-script syntax
@@ -305,7 +343,7 @@
               1)))))))
 
 (ert-deftest sed-ts-mode-classifies-comments ()
-  (dolist (syntax '(bre ere))
+  (dolist (syntax '(gsed gsed_ere sed sed_ere))
 
     (sed-ts-mode-test--with-script syntax
         (concat
@@ -341,7 +379,7 @@
         (should (nth 4 (syntax-ppss (point-max))))))))
 
 (ert-deftest sed-ts-mode-keeps-operand-quotes-and-escapes-as-punctuation ()
-  (dolist (syntax '(bre ere))
+  (dolist (syntax '(gsed gsed_ere sed sed_ere))
     (sed-ts-mode-test--with-script syntax "r file'\"`\\()[]{}\n"
       (syntax-propertize (point-max))
       (dolist (character '(?' ?\" ?` ?\\ ?\( ?\) ?\[ ?\] ?{ ?}))
@@ -350,6 +388,14 @@
           (should-not (nth 3 (syntax-ppss (1+ position)))))))))
 
 ;;;; Comment Commands
+
+(ert-deftest sed-ts-mode-inserts-comments-before-gnu-shell-operands ()
+  (dolist (language '(gsed gsed_ere))
+    (sed-ts-mode-test--with-script language "{\n  e echo one\\\n    two\n}\n"
+      (goto-char (sed-ts-mode-test--position "two"))
+      (comment-dwim nil)
+      (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                     "{\n  # \n  e echo one\\\n    two\n}\n")))))
 
 (ert-deftest sed-ts-mode-comments-and-uncomments ()
   (with-temp-buffer
@@ -366,7 +412,7 @@
   (dolist (case
            '(("a\\\n# text\n" "# a\\\n# # text\n")
              ("s/a/one\\\ntwo/\n" "# s/a/one\\\n# two/\n")))
-    (dolist (syntax '(bre ere))
+    (dolist (syntax '(gsed gsed_ere sed sed_ere))
       (sed-ts-mode-test--with-script syntax (car case)
         (let ((state (sed-ts-mode-test--buffer-state)))
           (comment-or-uncomment-region (point-min) (point-max))
@@ -378,7 +424,7 @@
           (should (equal (sed-ts-mode-test--buffer-state) state)))))))
 
 (ert-deftest sed-ts-mode-inserts-standalone-comments ()
-  (dolist (syntax '(bre ere))
+  (dolist (syntax '(gsed gsed_ere sed sed_ere))
     (pcase-dolist (`(,source ,line ,expected)
                    '(("p" 1 "# \np")
                      ("{\n  p\n}\n" 2 "{\n  # \n  p\n}\n")
@@ -397,7 +443,7 @@
         (should (equal (buffer-substring-no-properties (point-min) (point-max))
                        expected))
         (should (nth 4 (syntax-ppss))))))
-  (sed-ts-mode-test--with-script 'bre "a\\\ntext\n"
+  (sed-ts-mode-test--with-script 'sed "a\\\ntext\n"
     (narrow-to-region 4 (point-max))
     (goto-char (point-max))
     (forward-char -1)
@@ -410,7 +456,7 @@
 (ert-deftest sed-ts-mode-supplies-electric-pairs ()
   (let ((electric-pair-pairs '((?% . ?%)))
         (electric-pair-mode nil))
-    (dolist (syntax '(bre ere))
+    (dolist (syntax '(gsed gsed_ere sed sed_ere))
       (pcase-dolist (`(,prefix ,opening ,expected)
                      '(("" ?{ "{}")
                        ("s/" ?\( "s/()")
@@ -427,7 +473,7 @@
             (should (= (point) (1- (point-max))))))))
     (should (equal electric-pair-pairs '((?% . ?%)))))
   (let ((electric-pair-pairs '((?{ . ?>))))
-    (dolist (syntax '(bre ere))
+    (dolist (syntax '(gsed gsed_ere sed sed_ere))
       (pcase-dolist (`(,prefix ,opening ,expected)
                      '(("" ?{ "{>")))
         (sed-ts-mode-test--with-script syntax prefix
@@ -439,7 +485,7 @@
     (should (equal electric-pair-pairs '((?{ . ?>))))))
 
 (ert-deftest sed-ts-mode-respects-pair-newline-preferences ()
-  (dolist (syntax '(bre ere))
+  (dolist (syntax '(gsed gsed_ere sed sed_ere))
     (let ((calls 0))
       (pcase-dolist (`(,setting ,expected)
                      (list (list nil "{\n}")
@@ -459,7 +505,7 @@
           (should (eq electric-pair-open-newline-between-pairs setting)))))))
 
 (ert-deftest sed-ts-mode-pairs-delimiters-and-indents-on-return ()
-  (dolist (syntax '(bre ere))
+  (dolist (syntax '(gsed gsed_ere sed sed_ere))
     (pcase-dolist (`(,prefix ,suffix ,offset ,expand ,expected ,column)
                    '(("1,2" "" 2 t "1,2{\n  \n}" 2)
                      ("" "" 4 t "{\n    \n}" 4)
@@ -485,7 +531,7 @@
 
 (ert-deftest sed-ts-mode-restricts-pair-newlines-to-cst-contexts ()
   (let ((electric-pair-open-newline-between-pairs t))
-    (dolist (syntax '(bre ere))
+    (dolist (syntax '(gsed gsed_ere sed sed_ere))
       (pcase-dolist (`(,before ,after ,expected)
                      '(("{" "}" "{\n\n}")
                        ("1,3!{" "}" "1,3!{\n\n}")
@@ -508,6 +554,81 @@
 
 ;;;; Font Lock
 
+(ert-deftest sed-ts-mode-fontifies-gnu-extensions-by-level-and-context ()
+  (dolist (language '(gsed gsed_ere))
+    (dolist (level '(1 2 3 4))
+      (let ((treesit-font-lock-level level))
+        (sed-ts-mode-test--with-script language
+            (concat "#n note\n:again\n1~2p\n2,+3d\n$=\n/a/IM!p\n"
+                    "s/a/\\U&\\E\\1\\n/2gpew output\n"
+                    "s/\\x5ba\\x5d/str/\n"
+                    "e echo\\n\nv 4.10\nR input\nQ 7\nT again\nW output\nz\nF\n")
+          (font-lock-ensure)
+          (pcase-dolist (`(,line ,fragment ,minimum ,face)
+                         '(("#n note" "note" 1 font-lock-comment-face)
+                           (":again" ":" 2 font-lock-keyword-face)
+                           (":again" "again" 2 font-lock-constant-face)
+                           ("1~2p" "1" 3 font-lock-number-face)
+                           ("1~2p" "~" 4 font-lock-operator-face)
+                           ("2,+3d" "," 4 font-lock-punctuation-face)
+                           ("2,+3d" "+" 4 font-lock-operator-face)
+                           ("$=" "$" 3 font-lock-constant-face)
+                           ("/a/IM!p" "I" 3 font-lock-constant-face)
+                           ("/a/IM!p" "M" 3 font-lock-constant-face)
+                           ("/a/IM!p" "!" 4 font-lock-operator-face)
+                           ("s/a/\\U&\\E\\1\\n/2gpew output" "\\U" 3 font-lock-escape-face)
+                           ("s/a/\\U&\\E\\1\\n/2gpew output" "&" 3 font-lock-constant-face)
+                           ("s/a/\\U&\\E\\1\\n/2gpew output" "\\1" 3 font-lock-constant-face)
+                           ("s/a/\\U&\\E\\1\\n/2gpew output" "\\n" 3 font-lock-escape-face)
+                           ("s/a/\\U&\\E\\1\\n/2gpew output" "2" 3 font-lock-number-face)
+                           ("s/a/\\U&\\E\\1\\n/2gpew output" "ew output" 3 font-lock-constant-face)
+                           ("s/a/\\U&\\E\\1\\n/2gpew output" "output" 2 font-lock-string-face)
+                           ("s/\\x5ba\\x5d/str/" "\\x5b" 4 font-lock-escape-face)
+                           ("s/\\x5ba\\x5d/str/" "str" 2 font-lock-string-face)
+                           ("e echo\\n" "e" 2 font-lock-keyword-face)
+                           ("e echo\\n" "echo" 2 font-lock-string-face)
+                           ("e echo\\n" "\\n" 3 font-lock-escape-face)
+                           ("v 4.10" "4.10" 2 font-lock-string-face)
+                           ("R input" "R" 2 font-lock-keyword-face)
+                           ("R input" "input" 2 font-lock-string-face)
+                           ("Q 7" "7" 3 font-lock-number-face)
+                           ("T again" "T" 2 font-lock-keyword-face)
+                           ("W output" "W" 2 font-lock-keyword-face)
+                           ("z" "z" 2 font-lock-keyword-face)
+                           ("F" "F" 2 font-lock-keyword-face)))
+            (ert-info ((format "Level %s: %s / %s" level line fragment))
+              (should (eq (sed-ts-mode-test--face fragment nil line)
+                          (and (>= level minimum) face))))))))))
+
+(ert-deftest sed-ts-mode-fontifies-gnu-regexp-leaves-at-level-four ()
+  (pcase-dolist (`(,language ,group ,interval ,alternation)
+                 '((gsed "\\(a\\)" "a\\{2,3\\}" "a\\|b")
+                   (gsed_ere "(a)" "a{2,3}" "a|b")))
+    (dolist (level '(1 2 3 4))
+      (let ((treesit-font-lock-level level))
+        (sed-ts-mode-test--with-script language
+            (concat "s/" group interval alternation ".\\w\\b\\1[^a-z[:alpha:]]/x/\n")
+          (font-lock-ensure)
+          (pcase-dolist (`(,fragment ,offset ,face)
+                         `((,group 0 font-lock-bracket-face)
+                           (,interval 1 font-lock-bracket-face)
+                           ("2,3" 0 font-lock-number-face)
+                           ("," 0 font-lock-punctuation-face)
+                           (,alternation 1 font-lock-operator-face)
+                           ("." 0 font-lock-constant-face)
+                           ("\\w" 0 font-lock-constant-face)
+                           ("\\b" 0 font-lock-operator-face)
+                           ("\\1" 0 font-lock-constant-face)
+                           ("[^" 0 font-lock-bracket-face)
+                           ("[^" 1 font-lock-operator-face)
+                           ("a-z" 1 font-lock-operator-face)
+                           ("[:" 0 font-lock-bracket-face)
+                           ("[:" 1 font-lock-bracket-face)
+                           ("alpha" 0 font-lock-constant-face)))
+            (ert-info ((format "Level %s: %S" level fragment))
+              (should (eq (sed-ts-mode-test--face fragment offset)
+                          (and (= level 4) face))))))))))
+
 (ert-deftest sed-ts-mode-fontifies-by-level ()
   (dolist (level '(1 2 3 4))
     (with-temp-buffer
@@ -528,7 +649,7 @@
         (commands '("a\\" "b target" "c\\" "d" "D" "g" "G" "h" "H" "i\\" "l" "n"
                     "N" "p" "P" "q" "r input.txt" "s/a/b/" "t target"
                     "w output.txt" "x" "y/a/b/" ":target" "=")))
-    (sed-ts-mode-test--with-script 'bre
+    (sed-ts-mode-test--with-script 'sed
         (concat (mapconcat (lambda (command)
                              (if (string-suffix-p "\\" command)
                                  (concat command "\ntext\n")
@@ -548,7 +669,7 @@
 (ert-deftest sed-ts-mode-fontifies-language-syntax ()
   (let* ((treesit-font-lock-level 4)
          (substitution "s/^[[:alnum:]]*$/[&]/gipw substitutions.out"))
-    (sed-ts-mode-test--with-script 'bre
+    (sed-ts-mode-test--with-script 'sed
         (concat "# Addresses, arguments and data\n"
                 "1,10p\n"
                 "$=\n"
@@ -607,7 +728,7 @@
                       'font-lock-punctuation-face)))))))
 
 (ert-deftest sed-ts-mode-fontifies-compound-bracket-delimiters ()
-  (dolist (entry '((bre . sed) (ere . sed_ere)))
+  (dolist (entry '((sed . sed) (sed_ere . sed_ere)))
 
     (let ((line "/[[.x.][=y=][:alpha:]]/p")
           (treesit-font-lock-level 4))
@@ -643,7 +764,7 @@
          (escaped-delimiter "/a\\/b/p")
          (control-escape "/a\\nb/p")
          (extensions "/a\\|b\\+c\\?/p"))
-    (sed-ts-mode-test--with-script 'bre
+    (sed-ts-mode-test--with-script 'sed
         (concat expression "\n"
                 bracket "\n"
                 collating-symbol "\n"
@@ -696,7 +817,7 @@
   (let* ((treesit-font-lock-level 4)
          (expression "/^a\\.(a|[^[:alpha:]x-z]{2,3})+?.*$/p")
          (optional "/a?b/p"))
-    (sed-ts-mode-test--with-script 'ere
+    (sed-ts-mode-test--with-script 'sed_ere
         (concat expression "\n" optional "\n")
       (font-lock-ensure)
       (sed-ts-mode-test--should-have-faces
@@ -722,8 +843,27 @@
       (should (eq (sed-ts-mode-test--face "[^" 1 expression)
                   'font-lock-negation-char-face)))))
 
+(ert-deftest sed-ts-mode-fontifies-source-leaves-within-syntax-issues ()
+  (dolist (syntax '(sed sed_ere))
+    (let ((treesit-font-lock-level 4))
+      (pcase-dolist (`(,source ,fragment ,face)
+                     `((,(if (eq syntax 'sed) "/a\\{1,,2\\}/p\n" "/a{1,,2}/p\n")
+                        ",," font-lock-punctuation-face)
+                       ("/[a-c-e]/p\n" "-e" font-lock-operator-face)
+                       (":abcdefghi\n" "abcdefghi" font-lock-constant-face)
+                       (":aαb\n" "α" font-lock-constant-face)))
+        (ert-info ((format "%S: %S" syntax source))
+          (sed-ts-mode-test--with-script syntax source
+            (font-lock-ensure)
+            (should (eq (sed-ts-mode-test--face fragment) face))
+            (when (equal fragment ",,")
+              (should (eq (sed-ts-mode-test--face fragment 1) face)))
+            (should (treesit-query-capture
+                     (treesit-buffer-root-node syntax)
+                     '((syntax_issue) @issue)))))))))
+
 (ert-deftest sed-ts-mode-fontifies-only-written-command-separators ()
-  (dolist (syntax '(bre ere))
+  (dolist (syntax '(sed sed_ere))
 
     (let ((treesit-font-lock-level 4))
       (sed-ts-mode-test--with-script syntax "2p;3d\n  ;;  ;p; \n"
@@ -743,7 +883,7 @@
         (control "s/\\n/\\&/")
         (replacement "s/a/x\\/y/")
         (translation "y/abc/x\\/z/"))
-    (sed-ts-mode-test--with-script 'bre
+    (sed-ts-mode-test--with-script 'sed
         (concat control "\n" replacement "\n" translation "\n")
       (font-lock-ensure)
       (sed-ts-mode-test--should-have-faces
@@ -753,9 +893,9 @@
          (,translation "\\/" font-lock-escape-face))))))
 
 (ert-deftest sed-ts-mode-captures-only-leaves ()
-  (dolist (syntax '(bre ere))
+  (dolist (syntax '(gsed gsed_ere sed sed_ere))
 
-    (sed-ts-mode-test--with-regexp-syntax syntax
+    (sed-ts-mode-test--with-language syntax
       (dolist (source '("#n note\n{\ns/[[:alpha:]]*/text/g\n}\n:again\nr input\nw output\n"
                         "a\\\ntext\ns/a/\\1\\n&/\ny/a/b/\n"
                         ":a\000b\nb a\000b\nt a\000b\nr a\000b\nw a\000b\ns/a/b/w a\000b\n"))
@@ -772,8 +912,35 @@
 
 ;;;; Navigation
 
+(ert-deftest sed-ts-mode-navigates-gnu-commands-and-block-boundaries ()
+  (dolist (language '(gsed gsed_ere))
+    (pcase-dolist (`(,prefix ,unit ,suffix)
+                   '(("p;  " "1~2!d" "\n")
+                     ("p\n" "0,/end/{\ne echo;cmd\nQ 4\n}" "\n")
+                     ("{\n" "2,+3{\nz\n}" "\n}\n")
+                     ("p\n" "a inline\\\nnext" "\nd\n")
+                     ("p\n" "e echo;command" "\nd\n")
+                     ("p\n" ":again" ";T again\n")))
+      (sed-ts-mode-test--with-script language (concat prefix unit suffix)
+        (goto-char (1+ (length prefix)))
+        (forward-sexp)
+        (should (= (point) (1+ (+ (length prefix) (length unit)))))
+        (backward-sexp)
+        (should (= (point) (1+ (length prefix))))))
+    (sed-ts-mode-test--with-script language "  1~2!{\nz\n}\n"
+      (goto-char (sed-ts-mode-test--position "{"))
+      (forward-sexp)
+      (should (= (point) (1+ (sed-ts-mode-test--position "}"))))
+      (backward-sexp)
+      (should (= (point) 3)))
+    (sed-ts-mode-test--with-script language "s/abc/def/\ne echo hi\nR input\n"
+      (dolist (fragment '("abc" "def" "echo" "input"))
+        (goto-char (sed-ts-mode-test--position fragment))
+        (should (equal (treesit-node-type (treesit-thing-at-point 'sexp 'nested))
+                       "command"))))))
+
 (ert-deftest sed-ts-mode-navigates-commands-and-blocks ()
-  (dolist (syntax '(bre ere))
+  (dolist (syntax '(sed sed_ere))
     (pcase-dolist (`(,prefix ,unit ,suffix)
                    '(("" "p" ";d\n")
                      ("p;" "  1,3!d" "\n")
@@ -800,7 +967,7 @@
             (should (= (point) start))))))))
 
 (ert-deftest sed-ts-mode-navigates-label-definitions ()
-  (dolist (syntax '(bre ere))
+  (dolist (syntax '(gsed gsed_ere sed sed_ere))
     (sed-ts-mode-test--with-script
         syntax "p\n:first\ns/a/b/\nb first\n:last\nt first\n:\nd\n"
       (goto-char (point-max))
@@ -818,7 +985,7 @@
         (should (equal (treesit-defun-name node) "first"))))))
 
 (ert-deftest sed-ts-mode-updates-navigation-after-edits ()
-  (dolist (syntax '(bre ere))
+  (dolist (syntax '(sed sed_ere))
     (sed-ts-mode-test--with-script
         syntax "p;;\n# note\nd\n:old\np\n"
       (goto-char (point-min))
@@ -835,14 +1002,14 @@
       (should (equal (treesit-defun-name (treesit-thing-at-point 'defun 'top-level)) "new")))))
 
 (ert-deftest sed-ts-mode-navigates-shared-block-boundaries ()
-  (dolist (syntax '(bre ere))
+  (dolist (syntax '(sed sed_ere))
     (sed-ts-mode-test--with-script syntax "  1,3!{\np\n}\n"
       (goto-char (sed-ts-mode-test--position "{"))
       (forward-sexp)
       (should (= (point) (1+ (sed-ts-mode-test--position "}"))))
       (backward-sexp)
       (should (= (point) (point-min)))))
-  (dolist (syntax '(bre ere))
+  (dolist (syntax '(sed sed_ere))
     (sed-ts-mode-test--with-script syntax "s/abc/def/\na\\\ntext\nr file\n"
       (dolist (fragment '("abc" "def" "text" "file"))
         (goto-char (sed-ts-mode-test--position fragment))
@@ -851,9 +1018,22 @@
 
 ;;;; Imenu
 
+(ert-deftest sed-ts-mode-indexes-gnu-labels-and-refreshes-after-edits ()
+  (dolist (language '(gsed gsed_ere))
+    (sed-ts-mode-test--with-script language ":長いlabel;T 長いlabel\n:\n:again\n"
+      (let ((index (cdr (assoc "Label" (funcall imenu-create-index-function)))))
+        (should (equal (mapcar #'car index) '("長いlabel" "again")))
+        (should (equal (mapcar (lambda (entry) (marker-position (cdr entry))) index)
+                       (list 1 (sed-ts-mode-test--position ":again")))))
+      (goto-char (sed-ts-mode-test--position "again"))
+      (delete-char 5)
+      (insert "last")
+      (should (equal (mapcar #'car (cdr (assoc "Label" (funcall imenu-create-index-function))))
+                     '("長いlabel" "last"))))))
+
 (ert-deftest sed-ts-mode-indexes-definitions ()
   (pcase-dolist (`(,syntax . ,language)
-                 '((bre . sed) (ere . sed_ere)))
+                 '((sed . sed) (sed_ere . sed_ere)))
 
     (sed-ts-mode-test--with-script
         syntax "b again\n:again\nt done\n:done\n:\n"
@@ -874,7 +1054,7 @@
         (should-not (treesit-defun-name root))))))
 
 (ert-deftest sed-ts-mode-keeps-duplicate-labels-in-source-order ()
-  (dolist (syntax '(bre ere))
+  (dolist (syntax '(gsed gsed_ere sed sed_ere))
     (sed-ts-mode-test--with-script syntax ":same\n:\n:same\nb same\n"
       (let ((entries (cdr (assoc "Label" (funcall imenu-create-index-function)))))
         (should (equal (mapcar #'car entries) '("same" "same")))
@@ -883,8 +1063,17 @@
 
 ;;;; Indentation
 
+(ert-deftest sed-ts-mode-preserves-gnu-operand-indentation ()
+  (dolist (language '(gsed gsed_ere))
+    (pcase-dolist (`(,source ,expected)
+                   '(("{\ne echo one\\\n   two\nz\n}\n"
+                      "{\n  e echo one\\\n   two\n  z\n}\n")
+                     ("{\na inline\\\n  text\nQ 2\n}\n"
+                      "{\n  a inline\\\n  text\n  Q 2\n}\n")))
+      (should (equal (sed-ts-mode-test--indent language source) expected)))))
+
 (ert-deftest sed-ts-mode-indents-after-return ()
-  (dolist (syntax '(bre ere))
+  (dolist (syntax '(gsed gsed_ere sed sed_ere))
     (pcase-dolist (`(,source ,line ,offset ,expected)
                    '(("{\n  p\n}\n" 0 2 "{\n  \n  p\n}\n")
                      ("{\n  p\n}\n" 1 2 "{\n  p\n  \n}\n")
@@ -909,7 +1098,7 @@
           (should (equal (buffer-string) expected)))))))
 
 (ert-deftest sed-ts-mode-indents-structures ()
-  (dolist (syntax '(bre ere))
+  (dolist (syntax '(gsed gsed_ere sed sed_ere))
     (pcase-dolist (`(,source ,offset ,expected)
                    '(("{\np\n}\n" 2 "{\n  p\n}\n")
                      ("{\np\n}\n" 4 "{\n    p\n}\n")
@@ -919,7 +1108,7 @@
         (should (equal (sed-ts-mode-test--indent syntax source offset) expected))))))
 
 (ert-deftest sed-ts-mode-preserves-text-and-replacement-indentation ()
-  (dolist (syntax '(bre ere))
+  (dolist (syntax '(gsed gsed_ere sed sed_ere))
     (pcase-dolist (`(,source ,expected)
                    '(("{\na\\\n  text\\\n    continued\np\n}\n"
                       "{\n  a\\\n  text\\\n    continued\n  p\n}\n")
@@ -929,9 +1118,73 @@
 
 ;;;; Updates
 
+(ert-deftest sed-ts-mode-reparses-a-bom-moved-to-buffer-start ()
+  (pcase-dolist (`(,language ,file ,properties ,prefix ,body ,fragment ,face)
+                 '((gsed "test.sed" "posix = false\nere = false\n" "p\n" "# note\n" "note" font-lock-comment-face)
+                   (gsed_ere "test.sed" "posix = false\nere = true\n" "p\n" "# note\n" "note" font-lock-comment-face)
+                   (sed "test.sed" "posix = true\nere = false\n" "p\n" "# note\n" "note" font-lock-comment-face)
+                   (sed_ere "test.sed" "posix = true\nere = true\n" "p\n" "# note\n" "note" font-lock-comment-face)))
+    (dolist (narrow '(nil t))
+      (ert-info ((format "%s, narrowed: %s" language narrow))
+        (let ((default-directory
+               (file-name-as-directory (make-temp-file "sed-ts-mode-" t))))
+          (unwind-protect
+              (progn
+                (with-temp-file (expand-file-name ".editorconfig")
+                  (insert "root = true\n[*]\n" properties))
+                (with-temp-buffer
+                  (setq buffer-file-name (expand-file-name file))
+                  (insert prefix "\ufeff" body)
+                  (let ((treesit-font-lock-level 4)) (sed-ts-mode))
+                  (sed-ts-mode-test--buffer-state)
+                  (when narrow
+                    (narrow-to-region 1 (+ 2 (length prefix))))
+                  (delete-region 1 (1+ (length prefix)))
+                  (widen)
+                  (should (eq (treesit-parser-language treesit-primary-parser) language))
+                  (should (equal (treesit-parser-list) (list treesit-primary-parser)))
+                  (let ((state (sed-ts-mode-test--buffer-state))
+                        (tree (treesit-node-string
+                               (treesit-parser-root-node treesit-primary-parser)))
+                        (source (buffer-substring-no-properties (point-min) (point-max)))
+                        (filename buffer-file-name))
+                    (should (equal source (concat "\ufeff" body)))
+                    (should-not (get-text-property 1 'face))
+                    (goto-char (point-min))
+                    (search-forward fragment)
+                    (should (eq (get-text-property (1- (point)) 'face) face))
+                    (with-temp-buffer
+                      (setq buffer-file-name filename)
+                      (insert source)
+                      (let ((treesit-font-lock-level 4)) (sed-ts-mode))
+                      (should (equal state (sed-ts-mode-test--buffer-state)))
+                      (should (equal tree (treesit-node-string
+                                           (treesit-parser-root-node treesit-primary-parser))))))))
+            (delete-directory default-directory t)))))))
+
+(ert-deftest sed-ts-mode-refreshes-gnu-classifications-after-edits ()
+  (dolist (language '(gsed gsed_ere))
+    (let ((treesit-font-lock-level 4))
+      (pcase-dolist (`(,source ,old ,new ,fragment ,face)
+                     '(("s/a/\\U/\n" "\\U" "&" "&" font-lock-constant-face)
+                       ("s/a/&/\n" "&" "\\U" "\\U" font-lock-escape-face)
+                       ("1~2p\n" "2" "3" "3" font-lock-number-face)
+                       ("s/a/x/\n" "a" "\\x5ba\\x5d" "\\x5b" font-lock-escape-face)
+                       ("s/[[:unknown:]]/x/\n" "unknown" "alpha" "alpha" font-lock-constant-face)
+                       ("e echo\\n\n" "e " "# " "echo" font-lock-comment-face)
+                       ("# note\np\n" "# " "e " "note" font-lock-string-face)))
+        (sed-ts-mode-test--with-script language source
+          (sed-ts-mode-test--buffer-state)
+          (goto-char (sed-ts-mode-test--position old))
+          (delete-char (length old))
+          (insert new)
+          (font-lock-ensure)
+          (should (eq (sed-ts-mode-test--face fragment) face))
+          (sed-ts-mode-test--should-match-fresh-buffer 4))))))
+
 (ert-deftest sed-ts-mode-updates-like-fresh-buffer ()
-  (dolist (syntax '(bre ere))
-    (sed-ts-mode-test--with-regexp-syntax syntax
+  (dolist (syntax '(sed sed_ere))
+    (sed-ts-mode-test--with-language syntax
       (pcase-dolist (`(,source ,old ,new ,fragment ,face)
                      '(("s/[[.a." "a." "a.]]/x/\n" "a." font-lock-constant-face)
                        ("1!" "!" "!p\n" "p" font-lock-keyword-face)
@@ -950,7 +1203,7 @@
             (sed-ts-mode-test--should-match-fresh-buffer 4)))))))
 
 (ert-deftest sed-ts-mode-reclassifies-delimiters-after-edits ()
-  (sed-ts-mode-test--with-script 'bre "{\np\n}\n"
+  (sed-ts-mode-test--with-script 'sed "{\np\n}\n"
     (should (= (sed-ts-mode-test--syntax-class "}" nil "}") 5))
     (goto-char (point-min))
     (delete-char 1)
@@ -960,7 +1213,7 @@
     (should (= (sed-ts-mode-test--syntax-class "}" nil "}") 5))))
 
 (ert-deftest sed-ts-mode-recomputes-comment-syntax-after-edits ()
-  (dolist (syntax '(bre ere))
+  (dolist (syntax '(sed sed_ere))
 
     (sed-ts-mode-test--with-script syntax "p;# note\n"
       (should (sed-ts-mode-test--comment-p "#" 1 "p;# note"))
@@ -983,7 +1236,7 @@
   (pcase-dolist (`(,before ,after ,comment-before ,comment-after)
                  '(("" "s/" t nil) ("s/" "" nil t)))
     (ert-info ((format "%S → %S" before after))
-      (sed-ts-mode-test--with-script 'bre (concat before "# head\np\n# tail\n")
+      (sed-ts-mode-test--with-script 'sed (concat before "# head\np\n# tail\n")
         (let ((body (sed-ts-mode-test--position "p" "p")))
           (narrow-to-region body (point-max))
           (syntax-propertize (point-max))
@@ -1002,7 +1255,7 @@
             (should (eq (nth 4 (syntax-ppss (1+ head))) comment-after))))))))
 
 (ert-deftest sed-ts-mode-reclassifies-line-operands-after-issue-edits ()
-  (dolist (syntax '(bre ere))
+  (dolist (syntax '(sed sed_ere))
 
     (let ((treesit-font-lock-level 4))
       (pcase-dolist (`(,prefix ,face)
@@ -1028,12 +1281,12 @@
             (should (sed-ts-mode-test--comment-p "after" nil "# after"))))))))
 
 (ert-deftest sed-ts-mode-reclassifies-character-class-names-after-repair ()
-  (dolist (syntax '(bre ere))
+  (dolist (syntax '(sed sed_ere))
 
     (let ((treesit-font-lock-level 4))
       (pcase-dolist (`(,name ,faces)
                      '(("1" (nil))
-                       ("a-b" (nil nil nil))
+                       ("a-b" (font-lock-constant-face nil font-lock-constant-face))
                        ("α" (nil))
                        ("\0001" (nil nil))
                        ("a\0001" (font-lock-constant-face nil nil))))
@@ -1053,14 +1306,14 @@
                         'font-lock-constant-face)))
           (should-not
            (treesit-query-capture
-            (treesit-buffer-root-node (sed-ts-mode-test--language syntax))
+            (treesit-buffer-root-node syntax)
             '((syntax_issue) @issue))))))))
 
 (ert-deftest sed-ts-mode-updates-bre-anchors-before-multibyte-delimiters ()
   (let ((treesit-font-lock-level 4))
     (pcase-dolist (`(,delimiter ,neighbor)
                    '(("é" "è") ("あ" "ぃ") ("😀" "😁")))
-      (sed-ts-mode-test--with-script 'bre
+      (sed-ts-mode-test--with-script 'sed
           (concat "s" delimiter "$" neighbor delimiter "x" delimiter "\n")
         (pcase-dolist (`(,edit ,face)
                        '((nil font-lock-regexp-face)
@@ -1077,12 +1330,12 @@
           (let ((source (buffer-substring-no-properties (point-min) (point-max)))
                 (faces (sed-ts-mode-test--face-map)))
             (should (equal faces
-                           (sed-ts-mode-test--with-script 'bre source
+                           (sed-ts-mode-test--with-script 'sed source
                              (font-lock-ensure)
                              (sed-ts-mode-test--face-map))))))))))
 
 (ert-deftest sed-ts-mode-reclassifies-regexp-escapes-after-edits ()
-  (dolist (syntax '(bre ere))
+  (dolist (syntax '(sed sed_ere))
 
     (let ((treesit-font-lock-level 4))
       (sed-ts-mode-test--with-script syntax "/\\*/p\n"
@@ -1100,7 +1353,7 @@
                                'font-lock-keyword-face nil))))))))
 
 (ert-deftest sed-ts-mode-rebuilds-imenu-after-edits ()
-  (sed-ts-mode-test--with-script 'bre ":first\n"
+  (sed-ts-mode-test--with-script 'sed ":first\n"
     (should (equal (mapcar #'car (cdr (assoc "Label"
                                              (funcall imenu-create-index-function))))
                    '("first")))

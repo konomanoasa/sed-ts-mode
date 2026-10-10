@@ -4,7 +4,7 @@
 
 [Tree-sitter](https://tree-sitter.github.io/tree-sitter/)-based
 [Emacs](https://www.gnu.org/software/emacs/) major mode for
-POSIX.1-2024 sed.
+GNU sed 4.10 and POSIX.1-2024 sed.
 
 ## Requirement
 
@@ -41,20 +41,22 @@ Supports `treesit-font-lock-level`.
 | 3     | Numbers, constants, and escapes outside regular expressions |
 | 4     | Operators, punctuation, brackets, and regular expressions   |
 
-## Regexp Syntax
+## Parsing Conditions
 
-Select ERE for matching files in `.editorconfig`.
+Select POSIX syntax or ERE for matching files in `.editorconfig`.
 
 ```ini
 [*.sed]
-regex_dialect = ere
+posix = false
+ere = false
 ```
 
-BRE is the default. Only `bre` and `ere` are accepted.
-Restart the mode to apply changes.
+Both properties default to `false`, selecting GNU BRE.
+Only `true` and `false` are accepted. Restart the mode to apply changes.
 
 ## Grammar
 
+[tree-sitter-gsed](https://github.com/konomanoasa/tree-sitter-gsed) and
 [tree-sitter-sed](https://github.com/konomanoasa/tree-sitter-sed)
 
 ## License
