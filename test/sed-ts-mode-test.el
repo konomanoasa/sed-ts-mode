@@ -35,6 +35,22 @@
 
 ;;;; Helpers
 
+(defmacro sed-ts-mode-test--with-file (file properties source &rest body)
+  "Evaluate BODY with SOURCE in FILE using EditorConfig PROPERTIES."
+  (declare (indent 3) (debug (form form form body)))
+  `(let ((default-directory
+          (file-name-as-directory (make-temp-file "sed-ts-mode-" t))))
+     (unwind-protect
+         (progn
+           (with-temp-file (expand-file-name ".editorconfig")
+             (insert "root = true\n[*]\n" ,properties))
+           (with-temp-buffer
+             (setq buffer-file-name (expand-file-name ,file))
+             (insert ,source)
+             (sed-ts-mode)
+             ,@body))
+       (delete-directory default-directory t))))
+
 (defun sed-ts-mode-test--position (fragment &optional line)
   (save-excursion
     (goto-char (point-min))
@@ -126,15 +142,22 @@
         (push (list (get-text-property position 'face) (syntax-after position)) state)))
     (nreverse state)))
 
-(defun sed-ts-mode-test--should-match-fresh-buffer (level)
+(defun sed-ts-mode-test--should-match-fresh-buffer (&optional level compare-tree)
+  "Compare classifications at LEVEL and optionally COMPARE-TREE with fresh parsing."
   (let ((source (buffer-substring-no-properties (point-min) (point-max)))
         (state (sed-ts-mode-test--buffer-state))
-        (file buffer-file-name))
+        (tree (when compare-tree
+                (treesit-node-string (treesit-parser-root-node treesit-primary-parser))))
+        (file buffer-file-name)
+        (level (or level treesit-font-lock-level)))
     (with-temp-buffer
       (setq buffer-file-name file)
       (insert source)
       (let ((treesit-font-lock-level level)) (sed-ts-mode))
-      (should (equal state (sed-ts-mode-test--buffer-state))))))
+      (should (equal state (sed-ts-mode-test--buffer-state)))
+      (when compare-tree
+        (should (equal tree (treesit-node-string
+                             (treesit-parser-root-node treesit-primary-parser))))))))
 
 ;;;; Grammar
 
@@ -607,27 +630,31 @@
     (dolist (level '(1 2 3 4))
       (let ((treesit-font-lock-level level))
         (sed-ts-mode-test--with-script language
-            (concat "s/" group interval alternation ".\\w\\b\\1[^a-z[:alpha:]]/x/\n")
-          (font-lock-ensure)
-          (pcase-dolist (`(,fragment ,offset ,face)
-                         `((,group 0 font-lock-bracket-face)
-                           (,interval 1 font-lock-bracket-face)
-                           ("2,3" 0 font-lock-number-face)
-                           ("," 0 font-lock-punctuation-face)
-                           (,alternation 1 font-lock-operator-face)
-                           ("." 0 font-lock-constant-face)
-                           ("\\w" 0 font-lock-constant-face)
-                           ("\\b" 0 font-lock-operator-face)
-                           ("\\1" 0 font-lock-constant-face)
-                           ("[^" 0 font-lock-bracket-face)
-                           ("[^" 1 font-lock-operator-face)
-                           ("a-z" 1 font-lock-operator-face)
-                           ("[:" 0 font-lock-bracket-face)
-                           ("[:" 1 font-lock-bracket-face)
-                           ("alpha" 0 font-lock-constant-face)))
-            (ert-info ((format "Level %s: %S" level fragment))
-              (should (eq (sed-ts-mode-test--face fragment offset)
-                          (and (= level 4) face))))))))))
+                                       (concat "s/" group interval
+                                               (if (eq language 'gsed) "a\\{1b2\\}" "a{1b2}") alternation ".\\w\\b\\1[^a-z[:alpha:]]/x/\n")
+                                       (font-lock-ensure)
+                                       (pcase-dolist (`(,fragment ,offset ,face)
+                                                      `((,group 0 font-lock-bracket-face)
+                                                        (,interval 1 font-lock-bracket-face)
+                                                        ("2,3" 0 font-lock-number-face)
+                                                        ("1b2" 0 font-lock-number-face)
+                                                        ("1b2" 1 font-lock-regexp-face)
+                                                        ("1b2" 2 font-lock-number-face)
+                                                        ("," 0 font-lock-punctuation-face)
+                                                        (,alternation 1 font-lock-operator-face)
+                                                        ("." 0 font-lock-constant-face)
+                                                        ("\\w" 0 font-lock-constant-face)
+                                                        ("\\b" 0 font-lock-operator-face)
+                                                        ("\\1" 0 font-lock-constant-face)
+                                                        ("[^" 0 font-lock-bracket-face)
+                                                        ("[^" 1 font-lock-operator-face)
+                                                        ("a-z" 1 font-lock-operator-face)
+                                                        ("[:" 0 font-lock-bracket-face)
+                                                        ("[:" 1 font-lock-bracket-face)
+                                                        ("alpha" 0 font-lock-constant-face)))
+                                         (ert-info ((format "Level %s: %S" level fragment))
+                                           (should (eq (sed-ts-mode-test--face fragment offset)
+                                                       (and (= level 4) face))))))))))
 
 (ert-deftest sed-ts-mode-fontifies-by-level ()
   (dolist (level '(1 2 3 4))
@@ -1118,6 +1145,33 @@
 
 ;;;; Updates
 
+(ert-deftest sed-ts-mode-refreshes-edited-owners-without-parser-notifications ()
+  (pcase-dolist (`(,language ,file ,properties ,source ,fragment ,owner-start)
+                 '((sed "test.sed" "posix = true\nere = false\n" "s/a/b/\n" "a" 1)
+                   (sed_ere "test.sed" "posix = true\nere = true\n" "s/a/b/\n" "a" 1)
+                   (gsed "test.sed" "posix = false\nere = false\n" "s/a/b/\n" "a" 1)
+                   (gsed_ere "test.sed" "posix = false\nere = true\n" "s/a/b/\n" "a" 1)))
+    (dolist (narrow '(nil t))
+      (ert-info ((format "%s, narrowed: %s" language narrow))
+        (let ((treesit-font-lock-level 4))
+          (sed-ts-mode-test--with-file file properties source
+                                       (rename-buffer "sed-ts-mode-test" t)
+                                       (let ((noninteractive nil)) (font-lock-mode 1))
+                                       (sed-ts-mode-test--buffer-state)
+                                       (should (get-text-property owner-start 'fontified))
+                                       (let ((parser treesit-primary-parser))
+                                         (should-not (treesit-node-check (treesit-parser-root-node parser) 'has-error))
+                                         (dolist (notifier (treesit-parser-notifiers parser))
+                                           (treesit-parser-remove-notifier parser notifier))
+                                         (goto-char (sed-ts-mode-test--position fragment))
+                                         (when narrow
+                                           (narrow-to-region (line-beginning-position) (line-end-position)))
+                                         (insert "x")
+                                         (widen)
+                                         (should (eq parser treesit-primary-parser))
+                                         (should-not (get-text-property owner-start 'fontified))
+                                         (sed-ts-mode-test--should-match-fresh-buffer 4 t))))))))
+
 (ert-deftest sed-ts-mode-reparses-a-bom-moved-to-buffer-start ()
   (pcase-dolist (`(,language ,file ,properties ,prefix ,body ,fragment ,face)
                  '((gsed "test.sed" "posix = false\nere = false\n" "p\n" "# note\n" "note" font-lock-comment-face)
@@ -1126,41 +1180,22 @@
                    (sed_ere "test.sed" "posix = true\nere = true\n" "p\n" "# note\n" "note" font-lock-comment-face)))
     (dolist (narrow '(nil t))
       (ert-info ((format "%s, narrowed: %s" language narrow))
-        (let ((default-directory
-               (file-name-as-directory (make-temp-file "sed-ts-mode-" t))))
-          (unwind-protect
-              (progn
-                (with-temp-file (expand-file-name ".editorconfig")
-                  (insert "root = true\n[*]\n" properties))
-                (with-temp-buffer
-                  (setq buffer-file-name (expand-file-name file))
-                  (insert prefix "\ufeff" body)
-                  (let ((treesit-font-lock-level 4)) (sed-ts-mode))
-                  (sed-ts-mode-test--buffer-state)
-                  (when narrow
-                    (narrow-to-region 1 (+ 2 (length prefix))))
-                  (delete-region 1 (1+ (length prefix)))
-                  (widen)
-                  (should (eq (treesit-parser-language treesit-primary-parser) language))
-                  (should (equal (treesit-parser-list) (list treesit-primary-parser)))
-                  (let ((state (sed-ts-mode-test--buffer-state))
-                        (tree (treesit-node-string
-                               (treesit-parser-root-node treesit-primary-parser)))
-                        (source (buffer-substring-no-properties (point-min) (point-max)))
-                        (filename buffer-file-name))
-                    (should (equal source (concat "\ufeff" body)))
-                    (should-not (get-text-property 1 'face))
-                    (goto-char (point-min))
-                    (search-forward fragment)
-                    (should (eq (get-text-property (1- (point)) 'face) face))
-                    (with-temp-buffer
-                      (setq buffer-file-name filename)
-                      (insert source)
-                      (let ((treesit-font-lock-level 4)) (sed-ts-mode))
-                      (should (equal state (sed-ts-mode-test--buffer-state)))
-                      (should (equal tree (treesit-node-string
-                                           (treesit-parser-root-node treesit-primary-parser))))))))
-            (delete-directory default-directory t)))))))
+        (let ((treesit-font-lock-level 4))
+          (sed-ts-mode-test--with-file file properties (concat prefix "\ufeff" body)
+                                       (sed-ts-mode-test--buffer-state)
+                                       (when narrow (narrow-to-region 1 (+ 2 (length prefix))))
+                                       (delete-region 1 (1+ (length prefix)))
+                                       (widen)
+                                       (should (eq (treesit-parser-language treesit-primary-parser) language))
+                                       (should (equal (treesit-parser-list) (list treesit-primary-parser)))
+                                       (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                                                      (concat "\ufeff" body)))
+                                       (sed-ts-mode-test--buffer-state)
+                                       (should-not (get-text-property 1 'face))
+                                       (goto-char (point-min))
+                                       (search-forward fragment)
+                                       (should (eq (get-text-property (1- (point)) 'face) face))
+                                       (sed-ts-mode-test--should-match-fresh-buffer 4 t)))))))
 
 (ert-deftest sed-ts-mode-refreshes-gnu-classifications-after-edits ()
   (dolist (language '(gsed gsed_ere))
@@ -1172,15 +1207,17 @@
                        ("s/a/x/\n" "a" "\\x5ba\\x5d" "\\x5b" font-lock-escape-face)
                        ("s/[[:unknown:]]/x/\n" "unknown" "alpha" "alpha" font-lock-constant-face)
                        ("e echo\\n\n" "e " "# " "echo" font-lock-comment-face)
-                       ("# note\np\n" "# " "e " "note" font-lock-string-face)))
+                       ("# note\np\n" "# " "e " "note" font-lock-string-face)
+                       ("ax\\x41" "41" "41\\" "\\x41" font-lock-string-face)
+                       ("ax\\x41\\" "41\\" "41" "\\x41" font-lock-escape-face)))
         (sed-ts-mode-test--with-script language source
-          (sed-ts-mode-test--buffer-state)
-          (goto-char (sed-ts-mode-test--position old))
-          (delete-char (length old))
-          (insert new)
-          (font-lock-ensure)
-          (should (eq (sed-ts-mode-test--face fragment) face))
-          (sed-ts-mode-test--should-match-fresh-buffer 4))))))
+                                       (sed-ts-mode-test--buffer-state)
+                                       (goto-char (sed-ts-mode-test--position old))
+                                       (delete-char (length old))
+                                       (insert new)
+                                       (font-lock-ensure)
+                                       (should (eq (sed-ts-mode-test--face fragment) face))
+                                       (sed-ts-mode-test--should-match-fresh-buffer 4))))))
 
 (ert-deftest sed-ts-mode-updates-like-fresh-buffer ()
   (dolist (syntax '(sed sed_ere))
@@ -1279,6 +1316,23 @@
                         'font-lock-comment-face))
             (sed-ts-mode-test--should-match-fresh-buffer 4)
             (should (sed-ts-mode-test--comment-p "after" nil "# after"))))))))
+
+(ert-deftest sed-ts-mode-reclassifies-missing-file-operands-after-repair ()
+  (dolist (language '(sed sed_ere))
+    (dolist (verb '("r" "w"))
+      (let ((treesit-font-lock-level 4))
+        (sed-ts-mode-test--with-script language (concat verb ";p\n")
+                                       (font-lock-ensure)
+                                       (should (eq (sed-ts-mode-test--face "p") 'font-lock-keyword-face))
+                                       (goto-char 2)
+                                       (insert "file")
+                                       (font-lock-ensure)
+                                       (should (eq (sed-ts-mode-test--face "p") 'font-lock-string-face))
+                                       (sed-ts-mode-test--should-match-fresh-buffer 4)
+                                       (delete-region 2 6)
+                                       (font-lock-ensure)
+                                       (should (eq (sed-ts-mode-test--face "p") 'font-lock-keyword-face))
+                                       (sed-ts-mode-test--should-match-fresh-buffer 4))))))
 
 (ert-deftest sed-ts-mode-reclassifies-character-class-names-after-repair ()
   (dolist (syntax '(sed sed_ere))

@@ -43,7 +43,7 @@ Supports `treesit-font-lock-level`.
 
 ## Parsing Conditions
 
-Select POSIX syntax or ERE for matching files in `.editorconfig`.
+Set parsing conditions for matching files in `.editorconfig`.
 
 ```ini
 [*.sed]
@@ -51,8 +51,10 @@ posix = false
 ere = false
 ```
 
+Both properties accept `true` and `false`.
+`posix` selects POSIX syntax and `ere` selects ERE.
 Both properties default to `false`, selecting GNU BRE.
-Only `true` and `false` are accepted. Restart the mode to apply changes.
+Restart the mode to apply changes.
 
 ## Grammar
 

@@ -47,14 +47,14 @@
 
 (defconst sed-ts-mode--grammar-sources
   '((gsed "https://github.com/konomanoasa/tree-sitter-gsed"
-          :revision "v0.2.0")
+          :revision "v0.3.0")
     (gsed_ere "https://github.com/konomanoasa/tree-sitter-gsed"
-              :revision "v0.2.0"
+              :revision "v0.3.0"
               :source-dir "gsed_ere/src")
     (sed "https://github.com/konomanoasa/tree-sitter-sed"
-         :revision "v0.19.0")
+         :revision "v0.20.0")
     (sed_ere "https://github.com/konomanoasa/tree-sitter-sed"
-             :revision "v0.19.0"
+             :revision "v0.20.0"
              :source-dir "sed_ere/src"))
   "Tree-sitter grammar sources for GNU and POSIX sed.")
 
@@ -88,23 +88,107 @@
         (if ere 'sed_ere 'sed)
       (if ere 'gsed_ere 'gsed))))
 
-(defun sed-ts-mode--after-change (beg _end old-length)
-  "Reparse a BOM moved to the start by an edit at BEG of OLD-LENGTH."
-  (when (and (= beg 1) (> old-length 0))
+;;;; Incremental Updates
+
+(defconst sed-ts-mode-update--containers
+  '("command_list")
+  "Container nodes traversed to find an edited source unit.")
+
+(defvar-local sed-ts-mode-update--state nil
+  "Bounds and recovery state captured before a buffer edit.")
+
+(defvar-local sed-ts-mode-update--pending-range nil
+  "Edited owner range awaiting syntax propertization.")
+
+(defun sed-ts-mode-update--bounds (beg end)
+  "Return enclosing source-unit bounds around BEG and END."
+  (let ((start beg)
+        (finish end)
+        (root (treesit-parser-root-node treesit-primary-parser)))
+    (dolist (position (list (max (point-min) (1- beg))
+                            (min (point-max) end)))
+      (let ((node (treesit-node-at position treesit-primary-parser))
+            owner)
+        (while (and node (not (treesit-node-eq node root)))
+          (unless (member (treesit-node-type node)
+                          sed-ts-mode-update--containers)
+            (setq owner node))
+          (setq node (treesit-node-parent node)))
+        (when owner
+          (setq start (min start (treesit-node-start owner))
+                finish (max finish (treesit-node-end owner))))))
+    (cons start finish)))
+
+(defun sed-ts-mode-update--before-change (beg end)
+  "Save owner bounds and old-tree recovery state before changing BEG to END."
+  (when treesit-primary-parser
     (save-restriction
       (widen)
-      (when (eq (char-after 1) #xfeff)
-        (let* ((parser treesit-primary-parser)
-               (language (treesit-parser-language parser))
-               (notifiers (treesit-parser-notifiers parser))
-               (level (treesit-parser-embed-level parser)))
-          (treesit-parser-delete parser)
-          (setq treesit-primary-parser (treesit-parser-create language))
-          (treesit-parser-set-embed-level treesit-primary-parser level)
-          (dolist (notifier notifiers)
-            (treesit-parser-add-notifier treesit-primary-parser notifier))
-          (syntax-ppss-flush-cache 1)
-          (font-lock-flush))))))
+      (setq sed-ts-mode-update--state
+            (cons (sed-ts-mode-update--bounds beg end)
+                  (treesit-node-check
+                   (treesit-parser-root-node treesit-primary-parser)
+                   'has-error))))))
+
+(defun sed-ts-mode-update--reset-parser ()
+  "Replace the primary parser without reusing its old tree."
+  (let* ((parser treesit-primary-parser)
+         (language (treesit-parser-language parser))
+         (tag (treesit-parser-tag parser))
+         (ranges (treesit-parser-included-ranges parser))
+         (notifiers (treesit-parser-notifiers parser))
+         (level (treesit-parser-embed-level parser)))
+    (treesit-parser-delete parser)
+    (setq treesit-primary-parser (treesit-parser-create language nil nil tag))
+    (treesit-parser-set-included-ranges treesit-primary-parser ranges)
+    (treesit-parser-set-embed-level treesit-primary-parser level)
+    (dolist (notifier notifiers)
+      (treesit-parser-add-notifier treesit-primary-parser notifier))))
+
+(defun sed-ts-mode-update--after-change (beg end old-length)
+  "Refresh edited owners and avoid stale trees after BEG, END and OLD-LENGTH."
+  (when treesit-primary-parser
+    (let ((narrowed (buffer-narrowed-p)))
+      (save-restriction
+        (widen)
+        (let* ((state sed-ts-mode-update--state)
+               (reset (or (cdr state)
+                          (and (= beg 1) (> old-length 0)
+                               (eq (char-after 1) #xfeff)))))
+          (setq sed-ts-mode-update--state nil)
+          (when reset (sed-ts-mode-update--reset-parser))
+          (let* ((bounds (if reset (cons (point-min) (point-max))
+                           (sed-ts-mode-update--bounds beg end)))
+                 (start (min (car bounds) (or (caar state) beg)))
+                 (finish (min (point-max)
+                              (max (cdr bounds)
+                                   (+ (or (cdar state) (+ beg old-length))
+                                      (- end beg old-length)))))
+                 (pending sed-ts-mode-update--pending-range)
+                 (pending-end (cdr pending)))
+            (when (and pending-end (>= pending-end beg))
+              (setq pending-end (max end (+ pending-end (- end beg old-length)))))
+            (setq sed-ts-mode-update--pending-range
+                  (cons (min start (or (car pending) start))
+                        (min (point-max) (max finish (or pending-end finish)))))
+            (syntax-ppss-flush-cache start)
+            (font-lock-flush start finish)
+            (when narrowed (syntax-propertize finish))))))))
+
+(defun sed-ts-mode-update--extend-region (start end)
+  "Include edited owners when propertizing START to END."
+  (when sed-ts-mode-update--pending-range
+    (let ((bounds sed-ts-mode-update--pending-range))
+      (setq sed-ts-mode-update--pending-range nil)
+      (cons (max (point-min) (min start (car bounds)))
+            (min (point-max) (max end (cdr bounds)))))))
+
+(defun sed-ts-mode-update--setup ()
+  "Configure incremental updates for the current buffer."
+  (add-hook 'before-change-functions #'sed-ts-mode-update--before-change nil t)
+  (add-hook 'after-change-functions #'sed-ts-mode-update--after-change nil t)
+  (add-hook 'syntax-propertize-extend-region-functions
+            #'sed-ts-mode-update--extend-region nil t))
 
 ;;;; Syntax
 
@@ -646,7 +730,7 @@ Pass ARG to `uncomment-region-default'."
   (sed-ts-mode-imenu--setup)
   (sed-ts-mode-indent--setup)
   (treesit-major-mode-setup)
-  (add-hook 'after-change-functions #'sed-ts-mode--after-change nil t))
+  (sed-ts-mode-update--setup))
 
 ;;;###autoload
 (define-derived-mode sed-ts-mode prog-mode "Sed-TS"
